@@ -11,6 +11,1297 @@ const {
   normalizePath,
 } = require('obsidian');
 
+/* =========================================================
+   Integrated Image Display Engine
+   来源：image-grid 2.9.1，作为 image-workflow 内部展示模块运行。
+   不注册独立设置页，不改变主插件 ID / 数据目录。
+   ========================================================= */
+const IntegratedImageGridPlugin = (function () {
+  const module = { exports: {} };
+  const exports = module.exports;
+"use strict";
+const __igNativeRequire = require;
+const __igModules = Object.create(null);
+const __igCache = Object.create(null);
+__igModules["./settings"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ImageGridSettingTab = exports.DEFAULT_SETTINGS = void 0;
+exports.normalizeSettings = normalizeSettings;
+
+const obsidian_1 = require("obsidian");
+
+exports.DEFAULT_SETTINGS = {
+    layout: { gapRem: 0.5 },
+    interaction: { liveControls: true }
+};
+
+function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+function normalizeSettings(raw) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    const layout = source.layout && typeof source.layout === "object" ? source.layout : {};
+    const interaction = source.interaction && typeof source.interaction === "object" ? source.interaction : {};
+
+    return {
+        layout: {
+            gapRem: clampNumber(layout.gapRem, 0, 3, exports.DEFAULT_SETTINGS.layout.gapRem)
+        },
+        interaction: {
+            liveControls: typeof interaction.liveControls === "boolean"
+                ? interaction.liveControls
+                : exports.DEFAULT_SETTINGS.interaction.liveControls
+        }
+    };
+}
+
+// 主插件已提供统一设置页；此类只保留构造兼容，不渲染第二套设置。
+class ImageGridSettingTab extends obsidian_1.PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+    display() {
+        this.containerEl.empty();
+    }
+}
+exports.ImageGridSettingTab = ImageGridSettingTab;
+
+};
+
+__igModules["./parser"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.parseImageLine = parseImageLine;
+exports.looksLikeImageLine = looksLikeImageLine;
+
+function parseWikiImageParts(markdown) {
+    const match = String(markdown || "").match(/!\[\[([^\]]+)\]\]/);
+    if (!match)
+        return undefined;
+
+    const parts = match[1].split("|").map(part => part.trim());
+    const target = parts.shift() ?? "";
+    if (!target)
+        return undefined;
+
+    let widthPx;
+    const descriptionParts = [];
+
+    for (const part of parts) {
+        if (!part)
+            continue;
+        const size = part.match(/^(\d{1,4})(?:x\d{1,4})?$/i);
+        if (size) {
+            widthPx = Math.max(20, Math.min(4000, Number(size[1])));
+            continue;
+        }
+        descriptionParts.push(part);
+    }
+
+    return {
+        target,
+        description: descriptionParts.join(" | ").trim(),
+        widthPx,
+        renderMarkdown: `![[${target}]]`
+    };
+}
+
+function parseMarkdownImageParts(markdown) {
+    const match = String(markdown || "").match(/!\[([^\]]*)\]\(([^)]+)\)/);
+    if (!match)
+        return undefined;
+
+    const altParts = String(match[1] || "").split("|").map(part => part.trim()).filter(Boolean);
+    let widthPx;
+    const descriptionParts = [];
+
+    for (const part of altParts) {
+        const size = part.match(/^(\d{1,4})(?:x\d{1,4})?$/i);
+        if (size) {
+            widthPx = Math.max(20, Math.min(4000, Number(size[1])));
+            continue;
+        }
+        descriptionParts.push(part);
+    }
+
+    return {
+        description: descriptionParts.join(" | ").trim(),
+        widthPx,
+        renderMarkdown: markdown
+    };
+}
+
+function parseImageLine(line) {
+    const trimmed = String(line || "").trim();
+    const attrMatch = trimmed.match(/^(.*?)(?:\s+\{([^{}]+)\})\s*$/);
+    const rawMarkdown = attrMatch ? attrMatch[1].trim() : trimmed;
+    const options = {};
+
+    const wiki = parseWikiImageParts(rawMarkdown);
+    const markdownImage = wiki ? undefined : parseMarkdownImageParts(rawMarkdown);
+
+    let markdown = rawMarkdown;
+    if (wiki) {
+        markdown = wiki.renderMarkdown;
+        if (wiki.widthPx !== undefined)
+            options.widthPx = wiki.widthPx;
+        if (wiki.description)
+            options.description = wiki.description;
+    }
+    else if (markdownImage) {
+        markdown = markdownImage.renderMarkdown;
+        if (markdownImage.widthPx !== undefined)
+            options.widthPx = markdownImage.widthPx;
+        if (markdownImage.description)
+            options.description = markdownImage.description;
+    }
+
+    // 仅兼容旧 scale=；下一次修改宽度时会迁移到原生 |宽度。
+    if (attrMatch) {
+        for (const token of attrMatch[2].trim().split(/\s+/)) {
+            const eq = token.indexOf("=");
+            if (eq <= 0)
+                continue;
+            const key = token.slice(0, eq).trim().toLowerCase();
+            const value = token.slice(eq + 1).trim();
+            if (key === "scale") {
+                const n = Number(value.replace("%", ""));
+                if (Number.isFinite(n))
+                    options.scale = Math.min(300, Math.max(20, Math.round(n)));
+            }
+            else if (key === "caption-color") {
+                if (/^#[0-9a-fA-F]{3,8}$/.test(value))
+                    options.captionColor = value;
+            }
+            else if (key === "caption-size") {
+                const n = Number(value.replace(/px$/i, ""));
+                if (Number.isFinite(n))
+                    options.captionSize = Math.min(48, Math.max(10, Math.round(n)));
+            }
+            else if (key === "rotate") {
+                const n = Number(value.replace(/deg$/i, ""));
+                if (Number.isFinite(n)) {
+                    const normalized = ((Math.round(n) % 360) + 360) % 360;
+                    options.rotate = normalized;
+                }
+            }
+        }
+    }
+
+    return { markdown, rawMarkdown, options };
+}
+
+function looksLikeImageLine(line) {
+    const markdown = parseImageLine(line).markdown;
+    return /!\[\[[^\]]+\]\]/.test(markdown) || /!\[[^\]]*\]\([^)]+\)/.test(markdown);
+}
+
+};
+
+__igModules["./main"] = function(module, exports, require) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const obsidian_1 = require("obsidian");
+const view_1 = require("@codemirror/view");
+const state_1 = require("@codemirror/state");
+const settings_1 = require("./settings");
+const parser_1 = require("./parser");
+class ImageGridPlugin extends obsidian_1.Plugin {
+    constructor() {
+        super(...arguments);
+        this.settings = settings_1.DEFAULT_SETTINGS;
+        this.liveControlState = new Map();
+        this.legacyLiveBlockObservers = new Set();
+    }
+    async onload() {
+        await this.loadSettings();
+        this.registerNoteClassMode();
+        this.registerNoteClassLivePreview();
+        this.registerBlocks();
+        this.registerQuickCommands();
+        this.addSettingTab(new settings_1.ImageGridSettingTab(this.app, this));
+        this.register(() => {
+            for (const observer of this.legacyLiveBlockObservers)
+                observer.disconnect();
+            this.legacyLiveBlockObservers.clear();
+        });
+    }
+    async loadSettings() {
+        const raw = await this.loadData();
+        this.settings = (0, settings_1.normalizeSettings)(raw);
+    }
+    async saveSettings() {
+        this.settings = (0, settings_1.normalizeSettings)(this.settings);
+        await this.saveData(this.settings);
+    }
+    registerNoteClassMode() {
+        this.registerMarkdownPostProcessor((el, ctx) => {
+            try {
+                const preview = el.closest(".markdown-preview-view");
+                if (!preview || !preview.classList.contains("image-grid"))
+                    return;
+                this.enhanceNoteImageGroups(el);
+            }
+            catch (error) {
+                console.error("[image-grid] 笔记级 image-grid 自动分组失败", error);
+            }
+        });
+    }
+    enhanceNoteImageGroups(root) {
+        const paragraphs = [];
+        if (root.matches?.("p"))
+            paragraphs.push(root);
+        for (const paragraph of Array.from(root.querySelectorAll("p")))
+            paragraphs.push(paragraph);
+        for (const paragraph of paragraphs) {
+            if (paragraph.dataset.igAutoProcessed === "true" || paragraph.closest(".image-grid-block"))
+                continue;
+            const embeds = [];
+            let imageOnly = true;
+            for (const node of Array.from(paragraph.childNodes)) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if ((node.textContent ?? "").trim().length > 0)
+                        imageOnly = false;
+                    continue;
+                }
+                if (!(node instanceof HTMLElement))
+                    continue;
+                if (node.tagName === "BR")
+                    continue;
+                if (node.matches(".internal-embed.image-embed, .image-embed")) {
+                    embeds.push(node);
+                    continue;
+                }
+                imageOnly = false;
+            }
+            if (!imageOnly || embeds.length < 2)
+                continue;
+            const mode = embeds.length <= 2 ? "grid2" : embeds.length === 3 ? "grid3" : "grid4";
+            paragraph.dataset.igAutoProcessed = "true";
+            paragraph.addClass("image-grid-block", `image-grid-${mode}`, "image-grid-auto-group");
+            paragraph.dataset.igColumns = mode.replace("grid", "");
+            this.applyBlockVariables(paragraph, mode);
+            for (const embed of embeds)
+                embed.addClass("image-grid-item", "image-grid-auto-item");
+        }
+    }
+    registerNoteClassLivePreview() {
+        const plugin = this;
+        // Block Decoration 必须来自 StateField / decorations facet，
+        // 不能由 ViewPlugin 的 decorations 提供，否则 CodeMirror 会抛出
+        // “Block decorations may not be specified via plugins”。
+        /**
+         * Live Preview 不再尝试改变 CodeMirror 自身的 cm-line 排版。
+         * CodeMirror 会持续重建/测量行 DOM，强行把 cm-content 改成 flex/grid
+         * 在不同 Obsidian 版本和主题下都不可靠。
+         *
+         * 这里改用公开的 CodeMirror block widget：
+         * - 连续 2 张及以上图片在光标不处于该组时，替换为真正的 grid 容器；
+         * - 光标进入该组时自动还原 Markdown 行，保证可编辑；
+         * - 点击网格非按钮区域可快速进入该组源码；
+         * - 空行/普通文字天然成为组边界。
+         */
+        class NoteGridWidget extends view_1.WidgetType {
+            constructor(group, sourcePath, mode, settingsKey, groupKey) {
+                super();
+                this.group = group;
+                this.sourcePath = sourcePath;
+                this.mode = mode;
+                this.settingsKey = settingsKey;
+                this.groupKey = groupKey;
+                this.component = undefined;
+            }
+            eq(other) {
+                return other instanceof NoteGridWidget
+                    && other.sourcePath === this.sourcePath
+                    && other.mode === this.mode
+                    && other.settingsKey === this.settingsKey
+                    && other.groupKey === this.groupKey
+                    && other.group.length === this.group.length
+                    && other.group.every((entry, index) => entry.text === this.group[index]?.text && entry.from === this.group[index]?.from);
+            }
+            toDOM(view) {
+                const block = document.createElement("div");
+                block.className = `image-grid-block image-grid-${this.mode} image-grid-live-widget`;
+                block.dataset.igColumns = this.mode.replace("grid", "");
+                block.setAttribute("contenteditable", "false");
+                plugin.applyBlockVariables(block, this.mode);
+
+                const component = new obsidian_1.Component();
+                component.load();
+                this.component = component;
+
+                const sourceLines = this.group.map(entry => entry.text);
+                const sourceContext = {
+                    source: sourceLines.join("\n"),
+                    sourceLines,
+                    sourcePath: this.sourcePath,
+                    sourceLineStart: this.group[0].number - 1,
+                    mode: "note"
+                };
+
+                this.group.forEach((entry, index) => {
+                    const parsed = (0, parser_1.parseImageLine)(entry.text);
+                    const item = block.createDiv({ cls: "image-grid-item image-grid-live-widget-item" });
+                    item.dataset.igSourceIndex = String(index);
+                    item.dataset.igIndex = String(index + 1);
+                    item.dataset.igLine = String(entry.number);
+                    item.setAttribute("title", `图片 ${index + 1} · 点击进入第 ${entry.number} 行源码`);
+                    item.setAttribute("aria-label", `图片 ${index + 1}，点击进入对应源码行`);
+                    plugin.applyItemVariables(item, parsed.options);
+                    void obsidian_1.MarkdownRenderer.render(plugin.app, parsed.markdown, item, this.sourcePath, component)
+                        .then(() => {
+                        if (parsed.options.widthPx !== undefined)
+                            plugin.applyRenderedNativeWidth(item, parsed.options.widthPx);
+                        if (parsed.options.rotate !== undefined)
+                            plugin.applyRenderedRotation(item, parsed.options.rotate);
+                        if (parsed.options.description)
+                            plugin.applyRenderedDescription(item, parsed.options.description, parsed.options.widthPx, parsed.options.captionColor, parsed.options.captionSize);
+                        plugin.enhanceRenderedItem(item, parsed.options, sourceContext, index);
+                    })
+                        .catch(error => {
+                        console.error("[image-grid] Live Preview 网格图片渲染失败", error);
+                        item.empty();
+                        item.createDiv({ cls: "image-grid-error", text: "图片渲染失败" });
+                    });
+                });
+
+                // 点击图片主体可进入对应源码行；悬停工具栏/弹层内部点击不触发退出。
+                block.addEventListener("pointerdown", event => {
+                    const target = event.target;
+                    if (!(target instanceof HTMLElement))
+                        return;
+                    if (target.closest("button, input, .image-grid-live-controls, .image-grid-live-ratio-menu, .image-grid-live-scale-menu"))
+                        return;
+                    const item = target.closest(".image-grid-live-widget-item");
+                    const lineNumber = item instanceof HTMLElement ? Number(item.dataset.igLine) : this.group[0].number;
+                    const entry = this.group.find(candidate => candidate.number === lineNumber) ?? this.group[0];
+                    event.preventDefault();
+                    event.stopPropagation();
+                    view.dispatch({
+                        selection: { anchor: entry.from },
+                        scrollIntoView: true
+                    });
+                    view.focus();
+                });
+
+                return block;
+            }
+            destroy() {
+                if (this.component) {
+                    this.component.unload();
+                    this.component = undefined;
+                }
+            }
+            ignoreEvent() {
+                return false;
+            }
+        }
+
+        const settingsKey = () => JSON.stringify({
+            gap: plugin.settings.layout.gapRem,
+            controls: plugin.settings.interaction.liveControls
+        });
+
+        const buildDecorations = (state) => {
+            if (!plugin.editorDocumentHasImageGridClass(state.doc.toString()))
+                return view_1.Decoration.none;
+
+            const groups = [];
+            let current = [];
+
+            for (let number = 1; number <= state.doc.lines; number += 1) {
+                const line = state.doc.line(number);
+                if (plugin.isPureImageLine(line.text)) {
+                    current.push({ number, from: line.from, to: line.to, text: line.text });
+                    continue;
+                }
+
+                // 空行或任何非纯图片内容都立即结束当前组。
+                if (current.length > 0) {
+                    groups.push(current);
+                    current = [];
+                }
+            }
+
+            if (current.length > 0)
+                groups.push(current);
+
+            const ranges = [];
+            const sourcePath = plugin.app.workspace.getActiveFile()?.path ?? "";
+            const selectionRanges = state.selection.ranges;
+
+            for (const group of groups) {
+                const count = group.length;
+                const first = group[0];
+                const last = group[group.length - 1];
+
+                const selectionInside = selectionRanges.some(range => {
+                    const head = range.head;
+                    const anchor = range.anchor;
+                    return (head >= first.from && head <= last.to)
+                        || (anchor >= first.from && anchor <= last.to);
+                });
+
+                // 单图始终保留原生 Markdown 行。
+                // 多图只有当光标真正进入该组时才展开源码，离开后恢复网格。
+                if (count === 1 || selectionInside) {
+                    group.forEach(entry => {
+                        ranges.push(view_1.Decoration.line({
+                            attributes: {
+                                class: "image-grid-live-note-line image-grid-item image-grid-live-note-single",
+                                "data-ig-line": String(entry.number),
+                                style: `--ig-gap:${plugin.settings.layout.gapRem}rem;--ig-scale:${plugin.settings.layout.scalePercent}%;`
+                            }
+                        }).range(entry.from));
+                    });
+                    continue;
+                }
+
+                const mode = count === 2 ? "grid2" : count === 3 ? "grid3" : "grid4";
+                const groupKey = `${sourcePath}:${first.from}:${last.to}`;
+                const widget = new NoteGridWidget(group, sourcePath, mode, settingsKey(), groupKey);
+
+                // block replace 的起止位置必须落在完整行边界。
+                // 包含末尾换行，使下一段正文保持独立。
+                let to = last.to;
+                if (last.number < state.doc.lines)
+                    to += 1;
+
+                ranges.push(view_1.Decoration.replace({
+                    widget,
+                    block: true,
+                    inclusive: false
+                }).range(first.from, to));
+            }
+
+            return view_1.Decoration.set(ranges, true);
+        };
+
+        const decorationField = state_1.StateField.define({
+            create(state) {
+                return buildDecorations(state);
+            },
+            update(_decorations, transaction) {
+                // 文档、选择以及插件设置影响布局时，始终从当前 EditorState 重建。
+                // 对图片组规模通常很小，这比在 block decoration 上做脆弱的增量映射更可靠。
+                return buildDecorations(transaction.state);
+            },
+            provide(field) {
+                return view_1.EditorView.decorations.from(field);
+            }
+        });
+
+        this.registerEditorExtension(decorationField);
+
+
+        // 单图或光标进入图片组时使用 Obsidian 原生图片 DOM，继续挂载现有按钮。
+        const ensureFromEvent = (event) => {
+            const target = event.target;
+            if (!(target instanceof HTMLElement))
+                return;
+            const line = target.closest(".markdown-source-view.mod-cm6.is-live-preview .cm-line.image-grid-live-note-line");
+            if (!(line instanceof HTMLElement))
+                return;
+            void this.ensureNoteLiveControls(line);
+        };
+        this.registerDomEvent(document, "pointerover", ensureFromEvent, true);
+        this.registerDomEvent(document, "focusin", ensureFromEvent, true);
+    }
+
+    editorDocumentHasImageGridClass(text) {
+        const normalized = text.replace(/\r\n/g, "\n");
+        if (!normalized.startsWith("---\n"))
+            return false;
+        const end = normalized.indexOf("\n---", 4);
+        if (end < 0)
+            return false;
+        const frontmatter = normalized.slice(4, end).split("\n");
+        let collecting = false;
+        const values = [];
+        for (const rawLine of frontmatter) {
+            const line = rawLine.replace(/\t/g, "  ");
+            if (!collecting) {
+                const match = line.match(/^cssclasses\s*:\s*(.*)$/i);
+                if (!match)
+                    continue;
+                collecting = true;
+                if (match[1].trim())
+                    values.push(match[1].trim());
+                continue;
+            }
+            if (/^[A-Za-z0-9_-]+\s*:/.test(line) && !/^\s/.test(line))
+                break;
+            if (/^\s+/.test(line) || /^\s*-\s*/.test(line))
+                values.push(line.trim());
+        }
+        return values
+            .join(" ")
+            .replace(/[\[\]",']/g, " ")
+            .split(/\s+/)
+            .some(value => value.replace(/^-+/, "").trim() === "image-grid");
+    }
+    isPureImageLine(line) {
+        const parsed = (0, parser_1.parseImageLine)(line);
+        const markdown = parsed.markdown.trim();
+        if (!markdown)
+            return false;
+        const imagePattern = /!\[\[[^\]]+\]\]|!\[[^\]]*\]\([^)]+\)/g;
+        const matches = markdown.match(imagePattern);
+        if (!matches || matches.length === 0)
+            return false;
+        return markdown.replace(imagePattern, "").trim().length === 0;
+    }
+    async ensureNoteLiveControls(line) {
+        if (line.dataset.igControlsReady === "true" || !this.settings.interaction.liveControls)
+            return;
+        const sourceView = line.closest(".markdown-source-view.mod-cm6.is-live-preview");
+        if (!sourceView)
+            return;
+        const lineNumber = Number(line.dataset.igLine);
+        if (!Number.isInteger(lineNumber) || lineNumber < 1)
+            return;
+        const file = this.app.workspace.getActiveFile();
+        if (!(file instanceof obsidian_1.TFile))
+            return;
+        const activeEditor = this.app.workspace.activeEditor?.editor;
+        if (!activeEditor)
+            return;
+        const sourceLine = activeEditor.getLine(lineNumber - 1);
+        if (!this.isPureImageLine(sourceLine))
+            return;
+        const image = line.querySelector("img");
+        if (!image)
+            return;
+        line.dataset.igControlsReady = "true";
+        const parsed = (0, parser_1.parseImageLine)(sourceLine);
+        this.applyItemVariables(line, parsed.options);
+        if (parsed.options.widthPx !== undefined)
+            this.applyRenderedNativeWidth(line, parsed.options.widthPx);
+        if (parsed.options.description)
+            this.applyRenderedDescription(line, parsed.options.description, parsed.options.widthPx, parsed.options.captionColor, parsed.options.captionSize);
+        const sourceContext = {
+            source: sourceLine,
+            sourceLines: [sourceLine],
+            sourcePath: file.path,
+            sourceLineStart: lineNumber - 1,
+            mode: "note"
+        };
+        this.enhanceRenderedItem(line, parsed.options, sourceContext, 0);
+    }
+    registerBlocks() {
+        this.registerMarkdownCodeBlockProcessor("img-grid", async (source, el, ctx) => {
+            await this.renderGridBlock(source, el, ctx, "grid2");
+        });
+        this.registerMarkdownCodeBlockProcessor("img-grid-3", async (source, el, ctx) => {
+            await this.renderGridBlock(source, el, ctx, "grid3");
+        });
+        this.registerMarkdownCodeBlockProcessor("img-grid-4", async (source, el, ctx) => {
+            await this.renderGridBlock(source, el, ctx, "grid4");
+        });
+    }
+    registerQuickCommands() {
+        // 已融合到 Image Workflow：日常操作统一由 Live Preview 工具条和主插件命令负责。
+    }
+    getNativeWidthFromLine(line) {
+        const parsed = (0, parser_1.parseImageLine)(line);
+        return parsed.options.widthPx;
+    }
+    getNativeSizePresets() {
+        const supplied = typeof this.getWikiSizePresets === "function" ? this.getWikiSizePresets() : undefined;
+        const values = Array.isArray(supplied) ? supplied : [300, 400, 500, 600, 800];
+        const clean = Array.from(new Set(values
+            .map(value => Math.round(Number(value)))
+            .filter(value => Number.isFinite(value) && value >= 20 && value <= 4000)))
+            .sort((a, b) => a - b);
+        return clean.length > 0 ? clean : [300, 400, 500, 600, 800];
+    }
+    getDefaultNativeWidth() {
+        const supplied = typeof this.getWikiDefaultWidth === "function" ? Number(this.getWikiDefaultWidth()) : NaN;
+        return Number.isFinite(supplied) ? Math.max(20, Math.min(4000, Math.round(supplied))) : 500;
+    }
+    setImageScale(line, width) {
+        const value = Math.max(20, Math.min(4000, Math.round(Number(width))));
+        const leading = line.match(/^\s*/)?.[0] ?? "";
+        const trailing = line.match(/\s*$/)?.[0] ?? "";
+        const core = line.trim();
+        const attrMatch = core.match(/^(.*?)(?:\s+\{([^{}]+)\})\s*$/);
+        let markdown = (attrMatch ? attrMatch[1] : core).trimEnd();
+        let attrs = attrMatch ? attrMatch[2].trim().split(/\s+/).filter(Boolean) : [];
+
+        // 大小统一迁移到 Obsidian 原生语法，移除旧 scale= 参数。
+        attrs = attrs.filter(token => {
+            const key = token.split("=", 1)[0]?.toLowerCase();
+            return key !== "scale" && key !== "ratio" && key !== "aspect";
+        });
+
+        let changed = false;
+        markdown = markdown.replace(/!\[\[([^\]]+)\]\]/, (_full, body) => {
+            const parts = String(body).split("|").map(part => part.trim()).filter(Boolean);
+            const target = parts.shift() ?? "";
+            const suffix = parts.filter(part => !/^\d{2,4}(?:x\d{2,4})?$/i.test(part));
+            suffix.push(String(value));
+            changed = true;
+            return `![[${[target, ...suffix].join("|")}]]`;
+        });
+
+        // 外链 Markdown 图片也使用 Obsidian 支持的 alt|宽度 形式。
+        if (!changed) {
+            markdown = markdown.replace(/!\[([^\]]*)\](\([^)]+\))/, (_full, alt, destination) => {
+                const parts = String(alt).split("|").map(part => part.trim()).filter(Boolean)
+                    .filter(part => !/^\d{2,4}(?:x\d{2,4})?$/i.test(part));
+                parts.push(String(value));
+                changed = true;
+                return `![${parts.join("|")}]${destination}`;
+            });
+        }
+
+        if (!changed)
+            return line;
+
+        const attrText = attrs.length > 0 ? ` {${attrs.join(" ")}}` : "";
+        return `${leading}${markdown}${attrText}${trailing}`;
+    }
+    collectTargetImageLines(editor) {
+        const from = editor.getCursor("from");
+        const to = editor.getCursor("to");
+        const start = Math.min(from.line, to.line);
+        const end = Math.max(from.line, to.line);
+        const targets = [];
+        const noteClassMode = this.editorDocumentHasImageGridClass(editor.getValue());
+        for (let line = start; line <= end; line += 1) {
+            const sourceLine = editor.getLine(line);
+            const inLegacyBlock = this.isLineInsideGridBlock(editor, line);
+            const inNoteClass = noteClassMode && this.isPureImageLine(sourceLine);
+            if ((inLegacyBlock || inNoteClass) && (0, parser_1.looksLikeImageLine)(sourceLine))
+                targets.push(line);
+        }
+        return targets;
+    }
+    isLineInsideGridBlock(editor, targetLine) {
+        let insideGrid = false;
+        for (let line = 0; line <= targetLine; line += 1) {
+            const text = editor.getLine(line).trim();
+            if (/^```img-grid(?:-3|-4)?(?:\s.*)?$/.test(text)) {
+                insideGrid = true;
+                continue;
+            }
+            if (insideGrid && /^```\s*$/.test(text))
+                insideGrid = false;
+        }
+        return insideGrid;
+    }
+    async renderGridBlock(source, el, ctx, mode) {
+        const section = ctx.getSectionInfo(el);
+        const sourceLines = source.split(/\r?\n/);
+        const directive = this.resolveColumnsDirective(sourceLines, mode);
+        const effectiveMode = directive.mode;
+        const sourceContext = {
+            source,
+            sourceLines,
+            sourcePath: ctx.sourcePath,
+            sourceLineStart: section?.lineStart,
+            mode
+        };
+        el.empty();
+        const block = el.createDiv({ cls: `image-grid-block image-grid-${effectiveMode}` });
+        block.dataset.igColumns = effectiveMode.replace("grid", "");
+        this.applyBlockVariables(block, effectiveMode);
+        const nonEmptyLines = sourceContext.sourceLines
+            .map((line, sourceIndex) => ({ line, sourceIndex, parsed: (0, parser_1.parseImageLine)(line) }))
+            .filter(entry => entry.line.trim().length > 0 && entry.sourceIndex !== directive.sourceIndex);
+        if (nonEmptyLines.length === 0) {
+            block.createDiv({ cls: "image-grid-empty", text: "这个代码块里还没有图片。" });
+            return;
+        }
+
+        // legacy img-grid-*：列宽由内容本身决定。
+        // 有 |宽度 的 item 使用该真实宽度；没有宽度则使用图片自然尺寸。
+        // 整个网格允许 max-content 横向突破正文，但各列之间不会覆盖。
+        const columnCount = effectiveMode === "grid4" ? 4 : effectiveMode === "grid3" ? 3 : 2;
+        block.style.gridTemplateColumns = `repeat(${columnCount}, max-content)`;
+        block.style.width = "max-content";
+        block.style.maxWidth = "none";
+        block.style.overflow = "visible";
+
+        for (const { line, sourceIndex, parsed } of nonEmptyLines) {
+            const item = block.createDiv({ cls: "image-grid-item image-grid-legacy-item" });
+            item.dataset.igSourceIndex = String(sourceIndex);
+            const itemWidth = Number(parsed.options.widthPx);
+            if (Number.isFinite(itemWidth)) {
+                item.dataset.igWidth = String(Math.round(itemWidth));
+                item.style.width = `${Math.round(itemWidth)}px`;
+                item.style.maxWidth = "none";
+            }
+            item.style.justifySelf = "start";
+            this.applyItemVariables(item, parsed.options);
+            try {
+                await obsidian_1.MarkdownRenderer.render(this.app, parsed.markdown, item, ctx.sourcePath, this);
+                if (parsed.options.widthPx !== undefined)
+                    this.applyRenderedNativeWidth(item, parsed.options.widthPx);
+                if (parsed.options.rotate !== undefined)
+                    this.applyRenderedRotation(item, parsed.options.rotate);
+                if (parsed.options.description)
+                    this.applyRenderedDescription(item, parsed.options.description, parsed.options.widthPx, parsed.options.captionColor, parsed.options.captionSize);
+                this.enhanceRenderedItem(item, parsed.options, sourceContext, sourceIndex);
+            }
+            catch (error) {
+                console.error("[image-grid] 图片渲染失败", error);
+                item.empty();
+                item.createDiv({ cls: "image-grid-error", text: "图片渲染失败，请检查图片链接语法。" });
+            }
+        }
+
+        this.attachLegacyLiveCodeBlockSizing(el, block);
+    }
+    attachLegacyLiveCodeBlockSizing(el, block) {
+        const findFrame = () => {
+            let node = el.parentElement;
+            let fallback = null;
+            let depth = 0;
+
+            while (node && depth < 10) {
+                if (node.classList.contains("cm-content")
+                    || node.classList.contains("cm-scroller")
+                    || node.classList.contains("cm-editor")) {
+                    break;
+                }
+
+                if (node.classList.contains("cm-embed-block")
+                    || node.classList.contains("cm-preview-code-block")
+                    || node.classList.contains("HyperMD-codeblock")
+                    || node.matches?.("[class*='cm-embed-block']")
+                    || node.matches?.("[class*='cm-preview-code-block']")) {
+                    return node;
+                }
+
+                const style = window.getComputedStyle(node);
+                const hasBorder =
+                    parseFloat(style.borderLeftWidth) > 0
+                    || parseFloat(style.borderRightWidth) > 0
+                    || parseFloat(style.borderTopWidth) > 0
+                    || parseFloat(style.borderBottomWidth) > 0;
+
+                if (hasBorder)
+                    fallback = node;
+
+                node = node.parentElement;
+                depth += 1;
+            }
+
+            return fallback;
+        };
+
+        const sync = () => {
+            if (!el.isConnected || !block.isConnected)
+                return;
+
+            const frame = findFrame();
+            if (!(frame instanceof HTMLElement))
+                return;
+
+            el.classList.add("image-grid-legacy-live-root");
+            frame.classList.add("image-grid-legacy-live-frame");
+
+            if (!frame.dataset.igNaturalWidth) {
+                const natural = Math.ceil(frame.getBoundingClientRect().width);
+                if (natural > 0)
+                    frame.dataset.igNaturalWidth = String(natural);
+            }
+
+            // 清除上一轮插件写入值，再按当前真实网格重新测量。
+            frame.style.removeProperty("width");
+            frame.style.removeProperty("min-width");
+            frame.style.removeProperty("max-width");
+
+            const frameRect = frame.getBoundingClientRect();
+            const blockRect = block.getBoundingClientRect();
+            const naturalWidth = Number(frame.dataset.igNaturalWidth) || Math.ceil(frameRect.width);
+
+            const frameStyle = window.getComputedStyle(frame);
+            const rightPadding = parseFloat(frameStyle.paddingRight) || 0;
+            const rightBorder = parseFloat(frameStyle.borderRightWidth) || 0;
+
+            const contentRight = Math.ceil(
+                blockRect.right - frameRect.left + rightPadding + rightBorder
+            );
+            const desiredWidth = Math.max(naturalWidth, contentRight);
+
+            frame.style.setProperty("width", `${desiredWidth}px`, "important");
+            frame.style.setProperty("min-width", `${naturalWidth}px`, "important");
+            frame.style.setProperty("max-width", "none", "important");
+            frame.style.setProperty("overflow", "visible", "important");
+            frame.style.setProperty("box-sizing", "border-box", "important");
+
+            const rootWidth = Math.max(block.scrollWidth, Math.ceil(blockRect.width));
+            el.style.setProperty("width", `${rootWidth}px`, "important");
+            el.style.setProperty("max-width", "none", "important");
+            el.style.setProperty("overflow", "visible", "important");
+        };
+
+        // processor 触发时宿主可能还未挂入 CodeMirror，分时重试。
+        window.requestAnimationFrame(sync);
+        window.setTimeout(sync, 60);
+        window.setTimeout(sync, 180);
+
+        // 图片宽度变化后，自动重新计算代码块外框。
+        if (typeof ResizeObserver !== "undefined") {
+            const observer = new ResizeObserver(() => {
+                if (!el.isConnected) {
+                    observer.disconnect();
+                    this.legacyLiveBlockObservers.delete(observer);
+                    return;
+                }
+                window.requestAnimationFrame(sync);
+            });
+            observer.observe(block);
+            this.legacyLiveBlockObservers.add(observer);
+        }
+    }
+
+    resolveColumnsDirective(lines, fallbackMode) {
+        let sourceIndex;
+        let rawValue;
+        for (let index = 0; index < lines.length; index += 1) {
+            const trimmed = lines[index].trim();
+            if (!trimmed)
+                continue;
+            const match = trimmed.match(/^(?:columns|cols)\s*=\s*(auto|2|3|4)$/i);
+            if (match) {
+                sourceIndex = index;
+                rawValue = match[1].toLowerCase();
+            }
+            break;
+        }
+        if (!rawValue)
+            return { mode: fallbackMode, sourceIndex: undefined };
+        if (rawValue === "2")
+            return { mode: "grid2", sourceIndex };
+        if (rawValue === "3")
+            return { mode: "grid3", sourceIndex };
+        if (rawValue === "4")
+            return { mode: "grid4", sourceIndex };
+        const imageCount = lines.filter((line, index) => index !== sourceIndex && (0, parser_1.looksLikeImageLine)(line)).length;
+        if (imageCount <= 2)
+            return { mode: "grid2", sourceIndex };
+        if (imageCount === 3)
+            return { mode: "grid3", sourceIndex };
+        return { mode: "grid4", sourceIndex };
+    }
+    enhanceRenderedItem(item, options, sourceContext, sourceIndex) {
+        const primaryImage = item.querySelector("img");
+        if (!primaryImage)
+            return;
+
+        if (options.widthPx !== undefined)
+            this.applyRenderedNativeWidth(item, options.widthPx);
+        if (options.rotate !== undefined)
+            this.applyRenderedRotation(item, options.rotate);
+        if (options.description)
+            this.applyRenderedDescription(item, options.description, options.widthPx, options.captionColor, options.captionSize);
+
+        if (!this.settings.interaction.liveControls)
+            return;
+
+        const inLivePreview = Boolean(
+            item.closest?.(".markdown-source-view.mod-cm6.is-live-preview")
+            || item.hasClass?.("image-grid-live-widget-item")
+            || item.closest?.(".image-grid-live-widget")
+        );
+        if (inLivePreview)
+            this.createLiveControls(item, options, sourceContext, sourceIndex);
+    }
+    createLiveControls(item, options, sourceContext, sourceIndex) {
+        const controlKey = `${sourceContext.sourcePath}:${sourceContext.sourceLineStart ?? sourceContext.mode}:${sourceIndex}`;
+        const rememberedState = this.liveControlState.get(controlKey);
+        if (rememberedState && Date.now() - rememberedState.at < 5000) {
+            item.addClass("is-scale-menu-open");
+        }
+        else if (rememberedState) {
+            this.liveControlState.delete(controlKey);
+        }
+        const rememberMenu = (menu) => {
+            const state = { menu, at: Date.now() };
+            this.liveControlState.set(controlKey, state);
+            window.setTimeout(() => {
+                if (this.liveControlState.get(controlKey) === state)
+                    this.liveControlState.delete(controlKey);
+            }, 5000);
+        };
+        const forgetMenu = () => this.liveControlState.delete(controlKey);
+        const toolbar = item.createDiv({ cls: "image-grid-live-controls" });
+        toolbar.setAttr("role", "toolbar");
+        toolbar.setAttr("aria-label", "图片宽度与说明快捷调整");
+        const sourceLine = sourceContext.sourceLines?.[sourceIndex] ?? sourceContext.source ?? "";
+        let currentScale = this.getNativeWidthFromLine(sourceLine) ?? this.getDefaultNativeWidth();
+        if (!Number.isFinite(currentScale))
+            currentScale = this.getDefaultNativeWidth();
+        const stop = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        };
+        const minus = toolbar.createEl("button", {
+            cls: "image-grid-live-icon",
+            text: "−",
+            attr: { type: "button", "aria-label": "缩小图片宽度 50px", title: "缩小 50px" }
+        });
+        const scaleLabel = toolbar.createEl("button", {
+            cls: "image-grid-live-value",
+            text: `${currentScale}px`,
+            attr: { type: "button", "aria-label": "选择图片宽度", title: "选择图片宽度" }
+        });
+        const plus = toolbar.createEl("button", {
+            cls: "image-grid-live-icon",
+            text: "+",
+            attr: { type: "button", "aria-label": "放大图片宽度 50px", title: "放大 50px" }
+        });
+        const descriptionButton = toolbar.createEl("button", {
+            cls: "image-grid-live-description",
+            text: "标题",
+            attr: { type: "button", "aria-label": "修改图片标题", title: "修改图片标题" }
+        });
+        descriptionButton.addEventListener("click", event => {
+            stop(event);
+            item.removeClass("is-scale-menu-open");
+            forgetMenu();
+            if (typeof this.openImageDescriptionAtSource === "function") {
+                this.openImageDescriptionAtSource(sourceContext, sourceIndex);
+            }
+            else {
+                new obsidian_1.Notice("图片说明功能暂不可用。");
+            }
+        });
+
+        const scaleMenu = item.createDiv({ cls: "image-grid-live-scale-menu" });
+        scaleMenu.setAttr("role", "menu");
+        const scaleMenuHead = scaleMenu.createDiv({ cls: "image-grid-live-scale-menu-head" });
+        scaleMenuHead.createEl("strong", { text: "图片宽度" });
+        scaleMenuHead.createSpan({ text: "写入 Obsidian 原生 |宽度" });
+        const scaleChoices = scaleMenu.createDiv({ cls: "image-grid-live-scale-options" });
+        const updateScaleChoice = () => {
+            for (const button of Array.from(scaleChoices.querySelectorAll("button[data-ig-scale]"))) {
+                button.toggleClass("is-active", Number(button.dataset.igScale) === currentScale);
+            }
+        };
+        for (const preset of this.getNativeSizePresets()) {
+            const button = scaleChoices.createEl("button", {
+                text: `${preset}`,
+                cls: "image-grid-live-scale-option",
+                attr: { type: "button", "aria-label": `设置图片宽度 ${preset}px` }
+            });
+            button.dataset.igScale = String(preset);
+            button.addEventListener("click", event => {
+                stop(event);
+                rememberMenu("scale");
+                void applyScale(preset).then(() => updateScaleChoice());
+            });
+        }
+        const applyScale = async (next) => {
+            currentScale = Math.max(100, Math.min(4000, Math.round(Number(next) / 10) * 10));
+            this.applyRenderedNativeWidth(item, currentScale);
+            const ok = await this.persistRenderedScale(item, sourceContext, sourceIndex, currentScale);
+            if (ok) {
+                scaleLabel.setText(`${currentScale}px`);
+                updateScaleChoice();
+            }
+        };
+        minus.addEventListener("click", event => {
+            stop(event);
+            rememberMenu("scale");
+            void applyScale(currentScale - 50);
+        });
+        plus.addEventListener("click", event => {
+            stop(event);
+            rememberMenu("scale");
+            void applyScale(currentScale + 50);
+        });
+        scaleLabel.setAttr("aria-label", "选择图片大小");
+        scaleLabel.setAttr("title", "选择图片大小");
+        scaleLabel.addEventListener("click", event => {
+            stop(event);
+            const nextOpen = !item.hasClass("is-scale-menu-open");
+            item.toggleClass("is-scale-menu-open", nextOpen);
+            if (nextOpen) {
+                rememberMenu("scale");
+                updateScaleChoice();
+            }
+            else {
+                forgetMenu();
+            }
+        });
+        scaleMenu.addEventListener("pointerdown", stop);
+        toolbar.addEventListener("pointerdown", stop);
+        scaleMenu.addEventListener("click", event => event.stopPropagation());
+        item.addEventListener("keydown", event => {
+            if (event.key !== "Escape")
+                return;
+            item.removeClass("is-scale-menu-open");
+            forgetMenu();
+        });
+    }
+    applyRenderedRotation(item, rotation) {
+        const value = Number(rotation);
+        if (!Number.isFinite(value))
+            return;
+
+        const normalized = ((Math.round(value) % 360) + 360) % 360;
+        const image = item.querySelector("img");
+        if (!image)
+            return;
+
+        image.style.setProperty("--iwt-image-rotation", `${normalized}deg`);
+        image.style.setProperty("transform", `rotate(${normalized}deg)`, "important");
+        image.style.setProperty("transform-origin", "center center", "important");
+    }
+
+    renderCaptionInline(caption, text) {
+        caption.empty();
+        const source = String(text || "");
+        const token = /(\*\*[^*]+\*\*|~~[^~]+~~|\*[^*]+\*)/g;
+        let last = 0;
+        let match;
+
+        while ((match = token.exec(source)) !== null) {
+            if (match.index > last)
+                caption.appendText(source.slice(last, match.index));
+
+            const raw = match[0];
+            if (raw.startsWith("**")) {
+                caption.createEl("strong", { text: raw.slice(2, -2) });
+            }
+            else if (raw.startsWith("~~")) {
+                caption.createEl("s", { text: raw.slice(2, -2) });
+            }
+            else {
+                caption.createEl("em", { text: raw.slice(1, -1) });
+            }
+            last = match.index + raw.length;
+        }
+
+        if (last < source.length)
+            caption.appendText(source.slice(last));
+    }
+
+    applyRenderedDescription(item, description, width, captionColor, captionSize) {
+        const text = String(description || "").trim();
+        for (const old of Array.from(item.querySelectorAll(".image-grid-caption")))
+            old.remove();
+        if (!text)
+            return;
+
+        const image = item.querySelector("img");
+        if (!image)
+            return;
+
+        const wrapper = image.closest(".internal-embed.image-embed, .image-embed, .internal-embed")
+            || image.parentElement
+            || item;
+
+        wrapper.classList.add("image-grid-caption-host");
+        const numericWidth = Number(width);
+        const allowOverflow = item.hasClass?.("image-grid-legacy-item") || item.classList?.contains("image-grid-legacy-item");
+
+        if (Number.isFinite(numericWidth) && numericWidth > 0) {
+            const resolved = `${Math.round(numericWidth)}px`;
+            const finalWidth = allowOverflow ? resolved : `min(${resolved}, 100%)`;
+            wrapper.style.setProperty("width", finalWidth, "important");
+            wrapper.style.setProperty("max-width", allowOverflow ? "none" : "100%", "important");
+            wrapper.style.setProperty("box-sizing", "border-box", "important");
+            item.style.setProperty("width", finalWidth, "important");
+        }
+
+        const caption = document.createElement("span");
+        caption.className = "image-grid-caption";
+
+        if (/^#[0-9a-fA-F]{3,8}$/.test(String(captionColor || "")))
+            caption.style.setProperty("color", String(captionColor), "important");
+
+        const size = Number(captionSize);
+        if (Number.isFinite(size))
+            caption.style.setProperty("font-size", `${Math.min(48, Math.max(10, Math.round(size)))}px`, "important");
+
+        this.renderCaptionInline(caption, text);
+
+        if (Number.isFinite(numericWidth) && numericWidth > 0) {
+            caption.style.width = allowOverflow
+                ? `${Math.round(numericWidth)}px`
+                : `min(${Math.round(numericWidth)}px, 100%)`;
+        }
+
+        wrapper.appendChild(caption);
+    }
+
+    applyRenderedNativeWidth(item, width) {
+        const value = Math.max(20, Math.min(4000, Math.round(Number(width))));
+        item.style.setProperty("--ig-item-width", `${value}px`);
+        item.dataset.igWidth = String(value);
+
+        // 仅 legacy img-grid / img-grid-3 / img-grid-4 允许突破正文宽度。
+        const allowOverflow = item.hasClass?.("image-grid-legacy-item") || item.classList?.contains("image-grid-legacy-item");
+
+        const wrappers = Array.from(item.querySelectorAll("p, .internal-embed, .image-embed"));
+        for (const wrapper of wrappers) {
+            wrapper.style.setProperty("width", allowOverflow ? `${value}px` : `min(${value}px, 100%)`, "important");
+            wrapper.style.setProperty("max-width", allowOverflow ? "none" : "100%", "important");
+            wrapper.style.setProperty("overflow", allowOverflow ? "visible" : "hidden", "important");
+            wrapper.style.setProperty("box-sizing", "border-box", "important");
+        }
+
+        item.style.setProperty("width", allowOverflow ? `${value}px` : `min(${value}px, 100%)`, "important");
+        item.style.setProperty("max-width", allowOverflow ? "none" : "100%", "important");
+        item.style.setProperty("box-sizing", "border-box", "important");
+
+        const apply = () => {
+            const images = Array.from(item.querySelectorAll("img"));
+            for (const image of images) {
+                image.style.setProperty("width", allowOverflow ? `${value}px` : `min(${value}px, 100%)`, "important");
+                image.style.setProperty("min-width", allowOverflow ? `${value}px` : "0", "important");
+                image.style.setProperty("max-width", allowOverflow ? "none" : "100%", "important");
+                image.style.setProperty("height", "auto", "important");
+                image.style.setProperty("object-fit", "contain", "important");
+                image.style.setProperty("margin-left", "auto", "important");
+                image.style.setProperty("margin-right", "auto", "important");
+                image.removeAttribute("width");
+                image.removeAttribute("height");
+            }
+        };
+
+        apply();
+        window.requestAnimationFrame(() => apply());
+        window.setTimeout(() => apply(), 80);
+    }
+
+    async persistRenderedScale(item, sourceContext, sourceIndex, scale) {
+        try {
+            if (sourceContext.mode === "note" && sourceContext.sourceLineStart !== undefined) {
+                const editor = this.app.workspace.activeEditor?.editor;
+                const file = this.app.workspace.getActiveFile();
+                const targetLine = sourceContext.sourceLineStart + sourceIndex;
+                if (!editor || !(file instanceof obsidian_1.TFile) || file.path !== sourceContext.sourcePath) {
+                    new obsidian_1.Notice("当前编辑器已切换，未修改图片大小。");
+                    return false;
+                }
+                const original = editor.getLine(targetLine);
+                if (!(0, parser_1.looksLikeImageLine)(original)) {
+                    new obsidian_1.Notice("图片源码已变化，未修改大小。");
+                    return false;
+                }
+                const updated = this.setImageScale(original, scale);
+                editor.replaceRange(updated, { line: targetLine, ch: 0 }, { line: targetLine, ch: original.length });
+                this.applyRenderedNativeWidth(item, scale);
+                return true;
+            }
+            const file = this.app.vault.getAbstractFileByPath(sourceContext.sourcePath);
+            if (!(file instanceof obsidian_1.TFile)) {
+                new obsidian_1.Notice("找不到当前笔记文件，无法写回图片大小。");
+                return false;
+            }
+            const content = await this.app.vault.read(file);
+            const newline = content.includes("\r\n") ? "\r\n" : "\n";
+            const lines = content.split(/\r?\n/);
+            let targetLine;
+            if (sourceContext.mode === "note" && sourceContext.sourceLineStart !== undefined) {
+                targetLine = sourceContext.sourceLineStart + sourceIndex;
+            }
+            else {
+                const blockStart = this.findSourceBlockStart(lines, sourceContext);
+                if (blockStart === undefined) {
+                    new obsidian_1.Notice("无法定位图片源码，请重新进入实时阅览后再试。");
+                    return false;
+                }
+                targetLine = blockStart + 1 + sourceIndex;
+            }
+            const original = lines[targetLine];
+            if (original === undefined || !(0, parser_1.looksLikeImageLine)(original)) {
+                new obsidian_1.Notice("源码已发生变化，未修改图片大小。");
+                return false;
+            }
+            lines[targetLine] = this.setImageScale(original, scale);
+            await this.app.vault.modify(file, lines.join(newline));
+            this.applyRenderedNativeWidth(item, scale);
+            return true;
+        }
+        catch (error) {
+            console.error("[image-grid] 实时写回图片大小失败", error);
+            new obsidian_1.Notice("写回图片大小失败，请查看控制台错误信息。");
+            return false;
+        }
+    }
+    findSourceBlockStart(lines, context) {
+        const fence = this.modeFence(context.mode);
+        const candidates = [];
+        for (let index = 0; index < lines.length; index += 1) {
+            if (this.isModeFence(lines[index], fence))
+                candidates.push(index);
+        }
+        if (candidates.length === 0)
+            return undefined;
+        const exact = candidates.filter(start => this.blockBodyMatches(lines, start, context.sourceLines));
+        const pool = exact.length > 0 ? exact : candidates;
+        if (context.sourceLineStart === undefined)
+            return pool[0];
+        return pool.reduce((best, current) => Math.abs(current - context.sourceLineStart) < Math.abs(best - context.sourceLineStart) ? current : best);
+    }
+    blockBodyMatches(lines, start, sourceLines) {
+        for (let offset = 0; offset < sourceLines.length; offset += 1) {
+            const actual = lines[start + 1 + offset];
+            if (actual === undefined || actual.trimEnd() !== sourceLines[offset].trimEnd())
+                return false;
+        }
+        return /^```\s*$/.test((lines[start + 1 + sourceLines.length] ?? "").trim());
+    }
+    modeFence(mode) {
+        if (mode === "grid3")
+            return "img-grid-3";
+        if (mode === "grid4")
+            return "img-grid-4";
+        return "img-grid";
+    }
+    isModeFence(line, fence) {
+        const trimmed = line.trim();
+        const prefix = `\`\`\`${fence}`;
+        if (!trimmed.startsWith(prefix))
+            return false;
+        return trimmed.length === prefix.length || /\s/.test(trimmed.charAt(prefix.length));
+    }
+    applyBlockVariables(el, mode) {
+        el.style.setProperty("--ig-gap", `${this.settings.layout.gapRem}rem`);
+        if (mode === "grid2") {
+            el.style.setProperty("--ig-left", "1fr");
+            el.style.setProperty("--ig-right", "1fr");
+        }
+    }
+    applyItemVariables(el, options) {
+        // 1.1.6：展示逻辑统一为“原图比例 + 原生 Wiki 宽度”。
+        // 不再应用 ratio / fit / max-height 等二次视觉变形。
+        if (options.widthPx !== undefined)
+            el.style.setProperty("--ig-item-width", `${options.widthPx}px`);
+        else if (options.scale !== undefined)
+            el.style.setProperty("--ig-item-scale", `${options.scale}%`);
+    }
+}
+exports.default = ImageGridPlugin;
+
+};
+
+function __igRequire(id) {
+  if (!Object.prototype.hasOwnProperty.call(__igModules, id)) return __igNativeRequire(id);
+  if (__igCache[id]) return __igCache[id].exports;
+  const module = { exports: {} };
+  __igCache[id] = module;
+  __igModules[id](module, module.exports, __igRequire);
+  return module.exports;
+}
+const __igEntry = __igRequire("./main");
+module.exports = __igEntry && __igEntry.default ? __igEntry.default : __igEntry;
+
+  return module.exports;
+})();
+
 const PLUGIN_ID = 'image-workflow';
 const LEGACY_PLUGIN_ID = 'image-workflow-toolkit';
 const PLUGIN_NAME = 'image-workflow';
@@ -99,7 +1390,6 @@ const DEFAULT_SETTINGS = {
   requireUniqueFilename: true,
   requireFinalConfirmation: true,
   showRibbonIcon: true,
-  workflowMode: 'normal',
   quickSizePresets: '300,400,500,600,800',
   uniformSizeDefault: '500',
   resequenceNameMode: 'semantic',
@@ -112,6 +1402,31 @@ const DEFAULT_SETTINGS = {
   unusedReferenceFolders: [],
   unusedIncludeCanvas: true,
   unusedAutoSelectAll: true,
+  unusedProtectRecentDays: 3,
+  unusedProtectActiveNote: true,
+  unusedProtectNameKeywords: '',
+  imageDisplay: {
+    layout: {
+      gapRem: 0.5,
+    },
+    interaction: {
+      liveControls: false,
+    },
+  },
+  readingViewer: {
+    enabled: true,
+    openOnDoubleClick: true,
+    openOnModifierClick: true,
+    modifierKey: 'mod',
+    allowZoom: true,
+    allowWidth: true,
+    allowRotate: true,
+    allowTitle: true,
+    allowSourceLocate: true,
+    allowFileLocate: true,
+    allowCopyPath: true,
+    allowNavigation: true,
+  },
 };
 
 function joinPath(...segments) {
@@ -225,6 +1540,143 @@ function applyImageSizeToWikiEmbed(linkText, sizeValue) {
   return linkText;
 }
 
+
+function getImageRotationFromLine(line) {
+  const raw = String(line || '');
+  const match = raw.match(/\s+\{([^{}]+)\}\s*$/);
+  if (!match) return 0;
+
+  for (const token of match[1].trim().split(/\s+/)) {
+    const eq = token.indexOf('=');
+    if (eq <= 0) continue;
+    const key = token.slice(0, eq).trim().toLowerCase();
+    const value = token.slice(eq + 1).trim();
+    if (key === 'rotate') {
+      const n = Number(value.replace(/deg$/i, ''));
+      if (Number.isFinite(n)) return ((Math.round(n) % 360) + 360) % 360;
+    }
+  }
+  return 0;
+}
+
+function applyImageRotationToLine(line, rotation) {
+  const raw = String(line || '');
+  const match = raw.match(/^(.*?)(?:\s+\{([^{}]+)\})\s*$/);
+  const base = match ? match[1].trimEnd() : raw.trimEnd();
+  const attrs = match ? match[2].trim().split(/\s+/).filter(Boolean) : [];
+
+  const kept = attrs.filter((token) => {
+    const key = token.split('=', 1)[0]?.toLowerCase();
+    return key !== 'rotate';
+  });
+
+  const n = Number(rotation);
+  const normalized = Number.isFinite(n) ? ((Math.round(n) % 360) + 360) % 360 : 0;
+  if (normalized !== 0) kept.push(`rotate=${normalized}`);
+
+  return kept.length ? `${base} {${kept.join(' ')}}` : base;
+}
+
+function getImageCaptionStyleFromLine(line) {
+  const raw = String(line || '');
+  const match = raw.match(/\s+\{([^{}]+)\}\s*$/);
+  const result = { color: '', size: '' };
+  if (!match) return result;
+
+  for (const token of match[1].trim().split(/\s+/)) {
+    const eq = token.indexOf('=');
+    if (eq <= 0) continue;
+    const key = token.slice(0, eq).trim().toLowerCase();
+    const value = token.slice(eq + 1).trim();
+
+    if (key === 'caption-color' && /^#[0-9a-fA-F]{3,8}$/.test(value)) {
+      result.color = value;
+    }
+    if (key === 'caption-size') {
+      const n = Number(value.replace(/px$/i, ''));
+      if (Number.isFinite(n)) result.size = String(Math.min(48, Math.max(10, Math.round(n))));
+    }
+  }
+  return result;
+}
+
+function applyImageCaptionStyleToLine(line, style) {
+  const raw = String(line || '');
+  const match = raw.match(/^(.*?)(?:\s+\{([^{}]+)\})\s*$/);
+  const base = match ? match[1].trimEnd() : raw.trimEnd();
+  const attrs = match ? match[2].trim().split(/\s+/).filter(Boolean) : [];
+
+  const kept = attrs.filter((token) => {
+    const key = token.split('=', 1)[0]?.toLowerCase();
+    return key !== 'caption-color' && key !== 'caption-size';
+  });
+
+  const color = String(style?.color || '').trim();
+  const size = Number(style?.size);
+
+  if (/^#[0-9a-fA-F]{3,8}$/.test(color)) {
+    kept.push(`caption-color=${color}`);
+  }
+  if (Number.isFinite(size) && size >= 10 && size <= 48) {
+    kept.push(`caption-size=${Math.round(size)}`);
+  }
+
+  return kept.length ? `${base} {${kept.join(' ')}}` : base;
+}
+
+function getImageDescriptionFromEmbed(linkText) {
+  const raw = String(linkText || '').trim();
+
+  const wiki = /^!?\[\[([^\]]+)\]\]$/.exec(raw);
+  if (wiki) {
+    const parts = wiki[1].split('|').map((part) => part.trim());
+    parts.shift();
+    const description = parts.find((part) => part && !isImageSizeSuffix(part));
+    return description || '';
+  }
+
+  const markdown = /^!\[([^\]]*)\]\((<[^>]+>|[^)]+)\)$/.exec(raw);
+  if (markdown) {
+    const parts = String(markdown[1] || '').split('|').map((part) => part.trim()).filter(Boolean);
+    const description = parts.find((part) => part && !isImageSizeSuffix(part));
+    return description || '';
+  }
+
+  return '';
+}
+
+function applyImageDescriptionToEmbed(linkText, descriptionValue) {
+  const description = String(descriptionValue || '').trim();
+  const raw = String(linkText || '').trim();
+
+  const wiki = /^!?\[\[([^\]]+)\]\]$/.exec(raw);
+  if (wiki) {
+    const parts = wiki[1].split('|').map((part) => part.trim());
+    const target = parts.shift() || '';
+    if (!target) return linkText;
+
+    // 只保留尺寸后缀；非尺寸后缀视为旧“额外说明/别名”，统一替换。
+    const sizes = parts.filter((part) => part && isImageSizeSuffix(part));
+    const suffixes = [];
+    if (description) suffixes.push(description);
+    suffixes.push(...sizes);
+
+    return `![[${[target, ...suffixes].join('|')}]]`;
+  }
+
+  const markdown = /^!\[([^\]]*)\]\((<[^>]+>|[^)]+)\)$/.exec(raw);
+  if (markdown) {
+    const oldParts = String(markdown[1] || '').split('|').map((part) => part.trim()).filter(Boolean);
+    const sizes = oldParts.filter((part) => isImageSizeSuffix(part));
+    const altParts = [];
+    if (description) altParts.push(description);
+    altParts.push(...sizes);
+    return `![${altParts.join('|')}](${markdown[2]})`;
+  }
+
+  return linkText;
+}
+
 function isMarkdownFile(file) {
   return file instanceof TFile && file.extension === 'md';
 }
@@ -264,6 +1716,173 @@ function renderTemplate(template, data, frontmatter) {
     .replace(/{{heading}}/g, data.heading || data.firstHeading || '')
     .replace(/{{index}}/g, data.index || '');
   return sanitizeFilename(result);
+}
+
+class ImageDescriptionModal extends Modal {
+  constructor(app, initialDescription, initialStyle, onConfirm) {
+    super(app);
+    this.initialDescription = String(initialDescription || '');
+    this.initialStyle = initialStyle || { color: '', size: '' };
+    this.onConfirm = onConfirm;
+    this.isSubmitting = false;
+  }
+
+  onOpen() {
+    const { contentEl, titleEl } = this;
+    titleEl.setText('✏️ 图片标题');
+    this.containerEl.addClass('pirr-modal');
+    this.containerEl.addClass('iwt-caption-style-modal');
+
+    contentEl.createDiv({
+      cls: 'pirr-intro',
+      text: '标题显示在图片下方。可设置整体颜色和字号；局部文字支持 Markdown 加粗、斜体和删除线。',
+    });
+
+    const errorEl = contentEl.createDiv({ cls: 'pirr-error' });
+    errorEl.hide();
+
+    let value = this.initialDescription;
+    let color = String(this.initialStyle.color || '');
+    let size = String(this.initialStyle.size || '');
+    let textArea = null;
+    let colorPicker = null;
+
+    const wrapSelection = (before, after = before) => {
+      if (!textArea) return;
+      const el = textArea.inputEl;
+      const start = el.selectionStart ?? 0;
+      const end = el.selectionEnd ?? start;
+      const selected = el.value.slice(start, end);
+      const replacement = `${before}${selected}${after}`;
+      el.setRangeText(replacement, start, end, 'select');
+      value = el.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      const innerStart = start + before.length;
+      const innerEnd = innerStart + selected.length;
+      el.setSelectionRange(innerStart, innerEnd);
+      el.focus();
+    };
+
+    const submit = async () => {
+      if (this.isSubmitting) return;
+      this.isSubmitting = true;
+      try {
+        await this.onConfirm({
+          description: String(value || '').trim(),
+          color: /^#[0-9a-fA-F]{3,8}$/.test(color) ? color : '',
+          size: size ? Math.min(48, Math.max(10, Math.round(Number(size)))) : '',
+        });
+        this.close();
+      } catch (err) {
+        this.isSubmitting = false;
+        errorEl.setText(String(err && err.message ? err.message : err));
+        errorEl.show();
+      }
+    };
+
+    new Setting(contentEl)
+      .setName('标题文字')
+      .setDesc('例如：这是**说明**')
+      .addTextArea((text) => {
+        textArea = text;
+        text
+          .setPlaceholder('例如：这是**说明**')
+          .setValue(value)
+          .onChange((next) => { value = next; });
+        text.inputEl.rows = 3;
+        text.inputEl.addClass('pirr-text');
+        text.inputEl.addEventListener('keydown', async (evt) => {
+          if ((evt.ctrlKey || evt.metaKey) && evt.key === 'Enter') {
+            evt.preventDefault();
+            await submit();
+          }
+        });
+      });
+
+    const inlineToolbar = contentEl.createDiv({ cls: 'iwt-caption-inline-toolbar' });
+
+    const boldBtn = inlineToolbar.createEl('button', {
+      text: 'B',
+      cls: 'iwt-caption-inline-btn',
+      attr: { type: 'button', title: '局部加粗' },
+    });
+    boldBtn.style.fontWeight = '700';
+    boldBtn.onclick = () => wrapSelection('**');
+
+    const italicBtn = inlineToolbar.createEl('button', {
+      text: 'I',
+      cls: 'iwt-caption-inline-btn',
+      attr: { type: 'button', title: '局部斜体' },
+    });
+    italicBtn.style.fontStyle = 'italic';
+    italicBtn.onclick = () => wrapSelection('*');
+
+    const strikeBtn = inlineToolbar.createEl('button', {
+      text: 'S',
+      cls: 'iwt-caption-inline-btn',
+      attr: { type: 'button', title: '局部删除线' },
+    });
+    strikeBtn.style.textDecoration = 'line-through';
+    strikeBtn.onclick = () => wrapSelection('~~');
+
+    inlineToolbar.createSpan({
+      cls: 'iwt-caption-inline-help',
+      text: '先选中文字，再点 B / I / S',
+    });
+
+    new Setting(contentEl)
+      .setName('标题颜色')
+      .setDesc('留空表示跟随主题默认文字颜色。')
+      .addColorPicker((picker) => {
+        colorPicker = picker;
+        picker
+          .setValue(color || '#888888')
+          .onChange((next) => { color = next; });
+      })
+      .addButton((btn) => btn
+        .setButtonText('跟随主题')
+        .onClick(() => {
+          color = '';
+          if (colorPicker) colorPicker.setValue('#888888');
+        }));
+
+    new Setting(contentEl)
+      .setName('标题字号')
+      .setDesc('10–48px；留空表示使用插件默认字号。')
+      .addText((text) => text
+        .setPlaceholder('例如 16')
+        .setValue(size)
+        .onChange((next) => {
+          const n = Number(next.replace(/px$/i, '').trim());
+          size = Number.isFinite(n) ? String(Math.min(48, Math.max(10, Math.round(n)))) : '';
+        }))
+      .addButton((btn) => btn
+        .setButtonText('默认字号')
+        .onClick(() => {
+          size = '';
+          this.display?.();
+        }));
+
+    contentEl.createDiv({
+      cls: 'iwt-help',
+      text: '保存示例：![[图片.png|这是**说明**|500]] {caption-color=#8b5cf6 caption-size=16}',
+    });
+
+    window.setTimeout(() => {
+      if (textArea) {
+        textArea.inputEl.focus();
+        textArea.inputEl.setSelectionRange(textArea.inputEl.value.length, textArea.inputEl.value.length);
+      }
+    }, 0);
+
+    new Setting(contentEl)
+      .addButton((btn) => btn.setButtonText('保存').setCta().onClick(async () => { await submit(); }))
+      .addButton((btn) => btn.setButtonText('取消').onClick(() => this.close()));
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 class SizeModal extends Modal {
@@ -408,6 +2027,191 @@ class UniformSizeModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
+class ReadingImageViewerModal extends Modal {
+  constructor(app, plugin, context, item, state) {
+    super(app);
+    this.plugin = plugin;
+    this.context = context;
+    this.item = item;
+    this.rotation = Number(state?.rotation) || 0;
+    this.width = String(state?.width || plugin.settings.uniformSizeDefault || '500');
+    this.zoom = 1;
+  }
+
+  onOpen() {
+    this.containerEl.addClass('iwt-reading-image-viewer');
+    this.modalEl.addClass('iwt-reading-image-viewer__modal');
+    this.render();
+  }
+
+  render() {
+    const { contentEl, titleEl } = this;
+    contentEl.empty();
+    titleEl.setText(`🖼️ ${this.item.file?.name || '图片查看器'}`);
+
+    const stage = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__stage' });
+    const image = stage.createEl('img', {
+      cls: 'iwt-reading-image-viewer__image',
+      attr: {
+        src: this.context.src,
+        alt: this.context.alt || this.item.file?.name || '图片',
+      },
+    });
+
+    const applyPreviewTransform = () => {
+      image.style.transform = `scale(${this.zoom}) rotate(${this.rotation}deg)`;
+    };
+    applyPreviewTransform();
+
+    const meta = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__meta' });
+    const imagePath = this.item.file?.path || this.item.rawTarget || '';
+    const pathEl = meta.createSpan({ cls: 'iwt-reading-image-viewer__path', text: imagePath });
+    meta.createSpan({ text: `源码第 ${this.item.line + 1} 行` });
+
+    const viewerSettings = this.plugin.settings.readingViewer || {};
+
+    const fileActions = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__file-actions' });
+
+    if (viewerSettings.allowFileLocate !== false && this.item.file instanceof TFile) {
+      const locateFileBtn = fileActions.createEl('button', { text: '📂 定位图片文件' });
+      locateFileBtn.onclick = async () => {
+        await this.plugin.revealImageFileInNavigator(this.item.file);
+      };
+      pathEl.addClass('is-clickable');
+      pathEl.setAttribute('title', '点击在文件列表定位图片');
+      pathEl.onclick = async () => {
+        await this.plugin.revealImageFileInNavigator(this.item.file);
+      };
+    }
+
+    if (viewerSettings.allowCopyPath !== false && this.item.file instanceof TFile) {
+      const copyPathBtn = fileActions.createEl('button', { text: '📋 复制路径' });
+      copyPathBtn.onclick = async () => {
+        await this.plugin.copyImagePath(this.item.file);
+      };
+
+      const copyWikiBtn = fileActions.createEl('button', { text: '🔗 复制 Wiki 链接' });
+      copyWikiBtn.onclick = async () => {
+        await this.plugin.copyImageWikiLink(this.item.file);
+      };
+    }
+
+    if (viewerSettings.allowNavigation !== false) {
+      const prevBtn = fileActions.createEl('button', { text: '⬅️ 上一张' });
+      const nextBtn = fileActions.createEl('button', { text: '下一张 ➡️' });
+
+      prevBtn.onclick = async () => {
+        this.close();
+        await this.plugin.openAdjacentReadingImageViewer(this.context, this.item, -1);
+      };
+      nextBtn.onclick = async () => {
+        this.close();
+        await this.plugin.openAdjacentReadingImageViewer(this.context, this.item, 1);
+      };
+    }
+
+    const controls = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__controls' });
+
+    let updateZoom = (next) => {
+      this.zoom = Math.min(3, Math.max(0.25, next));
+      applyPreviewTransform();
+    };
+
+    if (viewerSettings.allowZoom !== false) {
+      const zoomOut = controls.createEl('button', { text: '−', attr: { title: '预览缩小' } });
+      const zoomLabel = controls.createEl('button', { text: '100%', attr: { title: '预览缩放；不会写入正文' } });
+      const zoomIn = controls.createEl('button', { text: '+', attr: { title: '预览放大' } });
+      updateZoom = (next) => {
+        this.zoom = Math.min(3, Math.max(0.25, next));
+        zoomLabel.setText(`${Math.round(this.zoom * 100)}%`);
+        applyPreviewTransform();
+      };
+      zoomOut.onclick = () => updateZoom(this.zoom - 0.1);
+      zoomIn.onclick = () => updateZoom(this.zoom + 0.1);
+      zoomLabel.onclick = () => updateZoom(1);
+    }
+
+    if (viewerSettings.allowRotate !== false) {
+      const rotateLeft = controls.createEl('button', { text: '↶ 90°', attr: { title: '左旋转并写回 rotate' } });
+      const rotateReset = controls.createEl('button', { text: `${this.rotation}°`, attr: { title: '点击恢复 0°' } });
+      const rotateRight = controls.createEl('button', { text: '↷ 90°', attr: { title: '右旋转并写回 rotate' } });
+      const persistRotation = async (next) => {
+        this.rotation = ((next % 360) + 360) % 360;
+        rotateReset.setText(`${this.rotation}°`);
+        applyPreviewTransform();
+        await this.plugin.setReadingImageRotation(this.context, this.item, this.rotation);
+      };
+      rotateLeft.onclick = async () => await persistRotation(this.rotation - 90);
+      rotateRight.onclick = async () => await persistRotation(this.rotation + 90);
+      rotateReset.onclick = async () => await persistRotation(0);
+    }
+
+    if (viewerSettings.allowWidth !== false) {
+      const widthWrap = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__width' });
+      widthWrap.createSpan({ text: '正文宽度' });
+
+      const presets = this.plugin.getSizePresets();
+      for (const preset of presets.slice(0, 8)) {
+        const btn = widthWrap.createEl('button', { text: `${preset}px` });
+        btn.onclick = async () => {
+          this.width = String(preset);
+          const ok = await this.plugin.setReadingImageWidth(this.context, this.item, this.width);
+          if (ok) btn.addClass('is-active');
+        };
+      }
+
+      const custom = widthWrap.createEl('input', {
+        type: 'number',
+        cls: 'iwt-reading-image-viewer__width-input',
+        attr: { min: '20', max: '4000', step: '10', value: this.width || '500' },
+      });
+      const applyWidth = widthWrap.createEl('button', { text: '应用宽度', cls: 'mod-cta' });
+      applyWidth.onclick = async () => {
+        const value = String(custom.value || '').trim();
+        if (!value) return;
+        this.width = value;
+        await this.plugin.setReadingImageWidth(this.context, this.item, value);
+      };
+    }
+
+    const actions = contentEl.createDiv({ cls: 'iwt-reading-image-viewer__actions' });
+
+    if (viewerSettings.allowTitle !== false) {
+      const titleBtn = actions.createEl('button', { text: '✏️ 标题' });
+      titleBtn.onclick = async () => {
+        this.close();
+        await this.plugin.editReadingImageTitle(this.context, this.item);
+      };
+    }
+
+    if (viewerSettings.allowSourceLocate !== false) {
+      const sourceBtn = actions.createEl('button', { text: '🧭 定位 Markdown 源码' });
+      sourceBtn.onclick = async () => {
+        this.close();
+        await this.plugin.focusImageSourceLine(this.context.activeFile, this.item.line, this.item.from || 0);
+      };
+    }
+
+    const resetBtn = actions.createEl('button', { text: '↺ 复位预览' });
+    resetBtn.onclick = () => {
+      updateZoom(1);
+      applyPreviewTransform();
+    };
+
+    const closeBtn = actions.createEl('button', { text: '关闭' });
+    closeBtn.onclick = () => this.close();
+
+    contentEl.createDiv({
+      cls: 'iwt-reading-image-viewer__help',
+      text: '双击或 Ctrl/Cmd + 点击图片打开。宽度、旋转、标题会写回当前笔记。',
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class NoteHealthModal extends Modal {
   constructor(app, report, plugin) {
     super(app);
@@ -415,67 +2219,156 @@ class NoteHealthModal extends Modal {
     this.plugin = plugin;
   }
 
+  async refreshReport() {
+    const file = this.report.activeFile;
+    if (!(file instanceof TFile)) return;
+    this.report = await this.plugin.buildCurrentNoteImageHealthReport(file);
+    this.contentEl.empty();
+    this.renderBody();
+  }
+
   onOpen() {
-    const { contentEl, titleEl } = this;
-    titleEl.setText('当前笔记图片体检');
+    const { titleEl } = this;
+    titleEl.setText('🩺 当前笔记图片体检');
     this.containerEl.addClass('pirr-modal');
+    this.containerEl.addClass('iwt-health-modal');
+    this.renderBody();
+  }
+
+  renderBody() {
+    const { contentEl } = this;
 
     const stats = contentEl.createDiv({ cls: 'pirr-health-grid' });
     const pairs = [
-      ['图片嵌入', this.report.total],
-      ['正常链接', this.report.normal],
-      ['缺失文件', this.report.missing],
-      ['无尺寸图片', this.report.noSize],
-      ['重复引用', this.report.duplicates],
-      ['同名风险', this.report.sameNameRisk],
-      ['外部链接', this.report.external],
-      ['可安全清洗', this.report.cleanable],
+      ['🖼️ 图片嵌入', this.report.total],
+      ['✅ 正常链接', this.report.normal],
+      ['❌ 缺失文件', this.report.missing],
+      ['📐 无尺寸图片', this.report.noSize],
+      ['🔁 重复引用', this.report.duplicates],
+      ['⚠️ 同名风险', this.report.sameNameRisk],
+      ['🌐 外部链接', this.report.external],
+      ['🧹 可安全清洗', this.report.cleanable],
     ];
     for (const [label, value] of pairs) createStatCard(stats, label, String(value));
 
     const summary = contentEl.createDiv({ cls: 'pirr-conflicts' });
     summary.createEl('h4', { text: '诊断结论' });
-    summary.createDiv({ text: this.report.riskLevel, cls: this.report.hasHighRisk ? 'pirr-error-text' : 'pirr-subtle' });
+    summary.createDiv({
+      text: this.report.riskLevel,
+      cls: this.report.hasHighRisk ? 'pirr-error-text' : 'pirr-subtle'
+    });
 
     const actions = new Setting(contentEl);
-    actions.addButton((btn) => btn.setButtonText('统一无尺寸图片').setCta().onClick(() => {
-      this.close();
-      new UniformSizeModal(this.app, this.plugin.settings.uniformSizeDefault || '500', async ({ sizeValue }) => {
-        await this.plugin.uniformCurrentNoteImageSize(sizeValue, 'missing');
-      }, this.plugin.getSizePresets()).open();
-    }));
-    actions.addButton((btn) => btn.setButtonText('预览安全清洗').onClick(async () => {
-      this.close();
-      await this.plugin.previewCleaning();
-    }));
-    actions.addButton((btn) => btn.setButtonText('重排图片编号').onClick(async () => {
-      this.close();
-      const file = this.plugin.getActiveFile();
-      if (!file) return;
-      const plan = await this.plugin.buildResequencePlan(file);
-      this.plugin.openResequencePreview(plan, async () => await this.plugin.executeResequencePlan(plan, file));
-    }));
-    actions.addButton((btn) => btn.setButtonText('关闭').onClick(() => this.close()));
+    actions.addButton((btn) => btn
+      .setButtonText('统一无尺寸图片')
+      .setCta()
+      .setDisabled(this.report.noSize === 0)
+      .onClick(() => {
+        this.close();
+        new UniformSizeModal(
+          this.app,
+          this.plugin.settings.uniformSizeDefault || '500',
+          async ({ sizeValue }) => {
+            await this.plugin.uniformCurrentNoteImageSize(sizeValue, 'missing');
+          },
+          this.plugin.getSizePresets()
+        ).open();
+      }));
+    actions.addButton((btn) => btn
+      .setButtonText('预览安全清洗')
+      .setDisabled(this.report.cleanable === 0)
+      .onClick(async () => {
+        this.close();
+        await this.plugin.previewCleaning();
+      }));
+    actions.addButton((btn) => btn
+      .setButtonText('重排预览')
+      .onClick(async () => {
+        this.close();
+        const file = this.plugin.getActiveFile();
+        if (!file) return;
+        const plan = await this.plugin.buildResequencePlan(file);
+        if (!plan.tasks.length) {
+          new Notice('当前笔记没有可重排图片');
+          return;
+        }
+        this.plugin.openResequencePreview(
+          plan,
+          async () => await this.plugin.executeResequencePlan(plan, file)
+        );
+      }));
+    actions.addButton((btn) => btn
+      .setButtonText('关闭')
+      .onClick(() => this.close()));
 
-    if (this.report.items.length > 0) {
-      const tableWrap = contentEl.createDiv({ cls: 'pirr-table-wrap' });
-      const table = tableWrap.createEl('table', { cls: 'pirr-table' });
-      const thead = table.createEl('thead');
-      const tr = thead.createEl('tr');
-      tr.createEl('th', { text: '行' });
-      tr.createEl('th', { text: '链接' });
-      tr.createEl('th', { text: '状态' });
-      const tbody = table.createEl('tbody');
-      for (const item of this.report.items.slice(0, 200)) {
-        const row = tbody.createEl('tr');
-        row.createEl('td', { text: String(item.line + 1) });
-        row.createEl('td', { text: item.fullMatch, cls: 'pirr-subtle' });
-        row.createEl('td', { text: item.status.join('；') || '正常', cls: item.status.length ? 'pirr-warning' : 'pirr-subtle' });
+    if (!this.report.items.length) {
+      contentEl.createDiv({ cls: 'pirr-subtle', text: '当前笔记没有检测到图片嵌入。' });
+      return;
+    }
+
+    const guide = contentEl.createDiv({ cls: 'iwt-health-guide' });
+    guide.setText('每一项都可以直接定位到源码；无尺寸图片可单独补默认宽度。缺失文件和同名风险不会自动修改，避免误修。');
+
+    const list = contentEl.createDiv({ cls: 'iwt-health-list' });
+    for (const item of this.report.items.slice(0, 250)) {
+      const row = list.createDiv({
+        cls: `iwt-health-row is-${item.severity || 'ok'}`
+      });
+
+      const meta = row.createDiv({ cls: 'iwt-health-row__meta' });
+      const head = meta.createDiv({ cls: 'iwt-health-row__head' });
+      head.createSpan({ cls: 'iwt-health-row__line', text: `第 ${item.line + 1} 行` });
+      head.createSpan({
+        cls: 'iwt-health-row__status',
+        text: item.status.join(' · ') || (item.cleanable ? '可安全清洗' : '正常')
+      });
+
+      meta.createDiv({ cls: 'iwt-health-row__link', text: item.fullMatch });
+      if (item.file instanceof TFile) {
+        meta.createDiv({ cls: 'iwt-health-row__path', text: item.file.path });
+      } else if (!item.external) {
+        meta.createDiv({ cls: 'iwt-health-row__path', text: `无法解析：${item.rawTarget}` });
       }
+
+      const rowActions = row.createDiv({ cls: 'iwt-health-row__actions' });
+
+      const locateBtn = rowActions.createEl('button', { text: '🧭 定位源码' });
+      locateBtn.onclick = async () => {
+        this.close();
+        await this.plugin.focusImageSourceLine(
+          this.report.activeFile,
+          item.line,
+          item.from
+        );
+      };
+
+      if (item.status.includes('无尺寸') && !item.external) {
+        const sizeBtn = rowActions.createEl('button', {
+          text: `补 ${this.plugin.settings.uniformSizeDefault || '500'}px`,
+          cls: 'mod-cta'
+        });
+        sizeBtn.onclick = async () => {
+          const changed = await this.plugin.setImageSizeAtSourceLine(
+            this.report.activeFile,
+            item,
+            this.plugin.settings.uniformSizeDefault || '500'
+          );
+          if (changed) await this.refreshReport();
+        };
+      }
+    }
+
+    if (this.report.items.length > 250) {
+      contentEl.createDiv({
+        cls: 'pirr-subtle',
+        text: `仅显示前 250 项；当前共 ${this.report.items.length} 项。`
+      });
     }
   }
 
-  onClose() { this.contentEl.empty(); }
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 class RenameModal extends Modal {
@@ -492,7 +2385,7 @@ class RenameModal extends Modal {
 
   onOpen() {
     const { contentEl, titleEl } = this;
-    titleEl.setText('粘贴图片设置');
+    titleEl.setText('📥 粘贴图片设置');
     this.containerEl.addClass('pirr-modal');
 
     const preview = contentEl.createDiv({ cls: 'pirr-preview-image' });
@@ -620,7 +2513,7 @@ class ResequencePreviewModal extends Modal {
 
   onOpen() {
     const { contentEl, titleEl } = this;
-    titleEl.setText('当前文章图片重排预览');
+    titleEl.setText('🔢 当前文章图片重排预览');
     this.containerEl.addClass('pirr-modal');
 
     const intro = contentEl.createDiv({ cls: 'pirr-intro' });
@@ -730,6 +2623,27 @@ async migrateLegacyLogFolder() {
 
 async onload() {
   this.settings = await this.loadSettingsWithMigration();
+
+  // 1.3.1：图片可视化修改统一迁移到阅读模式查看器。
+  this.settings.imageDisplay = this.settings.imageDisplay || {};
+  this.settings.imageDisplay.layout = Object.assign({ gapRem: 0.5 }, this.settings.imageDisplay.layout || {});
+  this.settings.imageDisplay.interaction = Object.assign({ liveControls: false }, this.settings.imageDisplay.interaction || {});
+  this.settings.imageDisplay.interaction.liveControls = false;
+
+  this.settings.readingViewer = Object.assign({
+    enabled: true,
+    openOnDoubleClick: true,
+    openOnModifierClick: true,
+    modifierKey: 'mod',
+    allowZoom: true,
+    allowWidth: true,
+    allowRotate: true,
+    allowTitle: true,
+    allowSourceLocate: true,
+    allowFileLocate: true,
+    allowCopyPath: true,
+    allowNavigation: true,
+  }, this.settings.readingViewer || {});
   await this.migrateLegacyLogFolder();
   if (!Number.isFinite(Number(this.settings.resequenceNumberPadding)) || Number(this.settings.resequenceNumberPadding) < 1) {
     this.settings.resequenceNumberPadding = 1;
@@ -744,6 +2658,8 @@ async onload() {
 
   this.ribbonIconEl = null;
   this.refreshRibbonIcon();
+
+  this.registerReadingModeImageViewer();
 
   this.addCommand({
     id: 'open-rename-modal-for-last-created-file',
@@ -761,6 +2677,25 @@ async onload() {
       }
       const generated = this.generateNewName(embed.file, file);
       this.openRenameModal(embed.file, generated.isMeaningful ? generated.stem : '', file.path, false, '', embed);
+    },
+  });
+
+
+  this.addCommand({
+    id: 'edit-current-line-image-description',
+    name: '当前行图片修改标题',
+    callback: async () => {
+      const file = this.getActiveFile();
+      if (!file) {
+        new Notice('未找到当前笔记');
+        return;
+      }
+      const embed = this.findCurrentLineFirstEmbed(file);
+      if (!embed) {
+        new Notice('当前行未检测到图片嵌入');
+        return;
+      }
+      this.openImageDescriptionModal(embed);
     },
   });
 
@@ -795,6 +2730,14 @@ async onload() {
       }
       const report = await this.buildCurrentNoteImageHealthReport(file);
       new NoteHealthModal(this.app, report, this).open();
+    },
+  });
+
+  this.addCommand({
+    id: 'open-reading-image-viewer',
+    name: '打开阅读模式图片查看器',
+    callback: async () => {
+      new Notice('在阅读模式中双击图片，或 Ctrl/Cmd + 点击图片即可打开查看器。');
     },
   });
 
@@ -850,7 +2793,7 @@ async onload() {
 
   this.addCommand({
     id: 'resequence-embedded-images-now',
-    name: '按当前文章顺序重排图片编号（立即执行）',
+    name: '按当前文章顺序重排图片编号（兼容入口：先预览）',
     callback: async () => {
       const activeFile = this.getActiveFile();
       if (!activeFile) {
@@ -862,27 +2805,13 @@ async onload() {
         new Notice('当前文章未检测到可重排的图片');
         return;
       }
-      await this.executeResequencePlan(plan, activeFile);
+      new Notice('为避免误操作，重排现在统一先显示预览。');
+      this.openResequencePreview(plan, async () => {
+        await this.executeResequencePlan(plan, activeFile);
+      });
     },
   });
 
-  this.addCommand({
-    id: 'batch-rename-all-images',
-    name: '按当前文章顺序重排图片编号（兼容入口）',
-    callback: async () => {
-      const activeFile = this.getActiveFile();
-      if (!activeFile) {
-        new Notice('未找到当前笔记');
-        return;
-      }
-      const plan = await this.buildResequencePlan(activeFile);
-      if (plan.tasks.length === 0) {
-        new Notice('当前文章未检测到可重排的图片');
-        return;
-      }
-      await this.executeResequencePlan(plan, activeFile);
-    },
-  });
 
   this.addCommand({
     id: 'open-image-cleaning-sidebar',
@@ -898,7 +2827,7 @@ async onload() {
 
   this.addCommand({
     id: 'preview-image-filename-cleaning',
-    name: '预览图片文件名清洗',
+    name: '预览图片链接清洗',
     callback: async () => {
       await this.previewCleaning();
     },
@@ -906,7 +2835,7 @@ async onload() {
 
   this.addCommand({
     id: 'apply-image-filename-cleaning',
-    name: '应用上次图片文件名清洗结果',
+    name: '应用上次图片链接清洗结果',
     callback: async () => {
       await this.applyLastPreview();
     },
@@ -938,20 +2867,91 @@ async onload() {
 
   this.addCommand({
     id: 'trash-last-unused-image-scan',
-    name: '删除上次扫描中的未引用图片',
+    name: '处理上次扫描中的未引用图片（先打开结果页）',
     callback: async () => {
       const files = this.lastUnusedImageScan?.unusedFiles || [];
       if (!files.length) {
-        new Notice('上次扫描没有可删除的未引用图片，请先执行扫描。');
+        new Notice('上次扫描没有可处理的未引用图片，请先执行扫描。');
         return;
       }
-      new IWTUnusedConfirmDeleteModal(this.app, files, async () => {
-        await this.trashUnusedImageFiles(files);
-      }).open();
+      new Notice('删除操作统一在结果页预览、选择并确认。');
+      await this.openUnusedImageView(this.lastUnusedImageScan);
     },
   });
 
+  await this.setupImageDisplayIntegration();
   this.addSettingTab(new ImageWorkflowSettingTab(this.app, this));
+}
+
+async setupImageDisplayIntegration() {
+  try {
+    const displayPlugin = new IntegratedImageGridPlugin(this.app, this.manifest);
+
+    // 展示模块沿用主插件 data.json，但只读写 imageDisplay 子树，
+    // 避免覆盖命名、清洗、重排等已有设置。
+    displayPlugin.loadData = async () => {
+      const value = this.settings.imageDisplay || {};
+      value.interaction = Object.assign({}, value.interaction || {}, { liveControls: false });
+      return value;
+    };
+    displayPlugin.saveData = async (value) => {
+      value = value || {};
+      value.interaction = Object.assign({}, value.interaction || {}, { liveControls: false });
+      this.settings.imageDisplay = value;
+      await this.saveData(this.settings);
+    };
+
+    // Live Preview 的大小按钮直接复用主插件已有 Wiki 尺寸配置，
+    // 不再维护第二套 scale 百分比预设。
+    displayPlugin.getWikiSizePresets = () => String(this.settings.quickSizePresets || '300,400,500,600,800')
+      .split(',')
+      .map((part) => Number(part.trim().replace(/px$/i, '')))
+      .filter((value) => Number.isFinite(value) && value >= 20 && value <= 4000);
+    displayPlugin.getWikiDefaultWidth = () => {
+      const value = Number(String(this.settings.uniformSizeDefault || '500').trim().replace(/px$/i, ''));
+      return Number.isFinite(value) ? value : 500;
+    };
+
+    // Live Preview 悬停工具条中的“说明”按钮调用主插件，
+    // 修改当前图片 Wiki 链接的额外说明，不改文件名。
+    displayPlugin.openImageDescriptionAtSource = (sourceContext, sourceIndex) => {
+      if (!sourceContext) {
+        new Notice('暂时无法定位图片源码');
+        return;
+      }
+      const expectedLine = Array.isArray(sourceContext.sourceLines)
+        ? String(sourceContext.sourceLines[sourceIndex] || '')
+        : String(sourceContext.source || '');
+      const lineNumber = sourceContext.sourceLineStart !== undefined
+        ? sourceContext.sourceLineStart + sourceIndex
+        : -1;
+      this.openImageDescriptionModalAtLine(lineNumber, sourceContext.sourcePath || '', expectedLine);
+    };
+
+    // 设置页已经融合到 image-workflow，不再注册第二套插件设置。
+    displayPlugin.addSettingTab = () => {};
+
+    // 日常操作以 Live Preview 悬停按钮为主，避免命令面板重复。
+    // 旧 img-grid 代码块仍由展示模块兼容。
+    displayPlugin.registerQuickCommands = () => {};
+
+    await displayPlugin.load();
+    displayPlugin.settings.interaction = Object.assign({}, displayPlugin.settings.interaction || {}, { liveControls: false });
+    this.imageDisplayPlugin = displayPlugin;
+    this.settings.imageDisplay = displayPlugin.settings;
+
+    // 主插件卸载时同步卸载展示模块注册的 CodeMirror / Markdown 资源。
+    this.register(() => {
+      try {
+        displayPlugin.unload();
+      } catch (error) {
+        console.error('[image-workflow] 卸载图片展示模块失败', error);
+      }
+    });
+  } catch (error) {
+    console.error('[image-workflow] 图片展示模块加载失败', error);
+    new Notice('图片展示模块加载失败；图片工作流其他功能仍可继续使用。');
+  }
 }
 
 onunload() {
@@ -965,6 +2965,7 @@ onunload() {
   this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   this.app.workspace.detachLeavesOfType(UNUSED_VIEW_TYPE);
 }
+
 
 async saveSettings() {
   await this.saveData(this.settings);
@@ -1021,13 +3022,66 @@ refreshRibbonIcon() {
   }
 
   async scanUnusedImages() {
-    const candidateImageFiles = this.getUnusedScanCandidateImageFiles();
-    const referencedFiles = await this.getUnusedScanReferencedFiles();
+    const allCandidateImageFiles = this.getUnusedScanCandidateImageFiles();
+
+    // 1) 最近创建保护
+    const protectDays = Math.max(0, Number(this.settings.unusedProtectRecentDays) || 0);
+    const cutoff = protectDays > 0 ? Date.now() - protectDays * 24 * 60 * 60 * 1000 : 0;
+    const protectedRecentFiles = cutoff > 0
+      ? allCandidateImageFiles.filter((file) => Number(file.stat?.ctime || 0) >= cutoff)
+      : [];
+
+    // 2) 文件名关键词保护
+    const protectKeywords = String(this.settings.unusedProtectNameKeywords || '')
+      .split(/[,，\n]/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    const protectedKeywordFiles = protectKeywords.length
+      ? allCandidateImageFiles.filter((file) => {
+          const haystack = `${file.basename} ${file.name} ${file.path}`.toLowerCase();
+          return protectKeywords.some((keyword) => haystack.includes(keyword));
+        })
+      : [];
+
+    // 3) 当前活动笔记强制保护。
+    // 即使用户把“引用扫描目录”限制到别处，当前正在编辑的笔记也不会被漏掉。
+    const protectedActiveNotePaths = new Set();
+    if (this.settings.unusedProtectActiveNote !== false) {
+      const activeFile = this.getActiveFile();
+      if (activeFile instanceof TFile && activeFile.extension === 'md') {
+        await this.collectUnusedScanReferencesFromMarkdown(activeFile, protectedActiveNotePaths);
+      }
+    }
+
+    const protectedPaths = new Set([
+      ...protectedRecentFiles.map((file) => file.path),
+      ...protectedKeywordFiles.map((file) => file.path),
+      ...protectedActiveNotePaths,
+    ]);
+
+    const candidateImageFiles = allCandidateImageFiles.filter((file) => !protectedPaths.has(file.path));
+
+    // 正常引用扫描
+    const referenceFiles = this.getUnusedScanReferenceFiles();
+    const referencedFiles = await this.getUnusedScanReferencedFiles(referenceFiles);
+
+    // 当前活动笔记保护同时视作引用，方便结果解释。
+    for (const path of protectedActiveNotePaths) referencedFiles.add(path);
+
     const unusedFiles = candidateImageFiles.filter((file) => !referencedFiles.has(file.path));
     unusedFiles.sort((a, b) => a.path.localeCompare(b.path, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' }));
+
+    const protectedActiveNoteFiles = allCandidateImageFiles.filter((file) => protectedActiveNotePaths.has(file.path));
+
     return {
+      allCandidateImageFiles,
       candidateImageFiles,
+      protectedRecentFiles,
+      protectedKeywordFiles,
+      protectedActiveNoteFiles,
+      protectKeywords,
       referencedFiles,
+      referenceFileCount: referenceFiles.length,
       unusedFiles,
       scannedAt: new Date(),
     };
@@ -1048,10 +3102,10 @@ refreshRibbonIcon() {
     });
   }
 
-  async getUnusedScanReferencedFiles() {
+  async getUnusedScanReferencedFiles(files = null) {
     const referenced = new Set();
-    const files = this.getUnusedScanReferenceFiles();
-    for (const file of files) {
+    const sourceFiles = Array.isArray(files) ? files : this.getUnusedScanReferenceFiles();
+    for (const file of sourceFiles) {
       if (file.extension === 'md') await this.collectUnusedScanReferencesFromMarkdown(file, referenced);
       if (file.extension === 'canvas' && this.settings.unusedIncludeCanvas) await this.collectUnusedScanReferencesFromCanvas(file, referenced);
     }
@@ -1108,9 +3162,24 @@ refreshRibbonIcon() {
       new Notice('没有可删除的文件。');
       return;
     }
+
+    // 删除前重新执行一次完整扫描。
+    // 这样如果“扫描结果生成后”用户又在笔记里引用了某张图片，它会被自动跳过。
+    const freshScan = await this.scanUnusedImages();
+    const safePaths = new Set(freshScan.unusedFiles.map((file) => file.path));
+    const stillUnused = files.filter((file) => safePaths.has(file.path));
+    const reProtected = files.filter((file) => !safePaths.has(file.path));
+
+    if (!stillUnused.length) {
+      this.lastUnusedImageScan = freshScan;
+      await this.refreshUnusedImageViews();
+      new Notice('删除已取消：所选图片在重新检查后均已被引用或受到保护。');
+      return;
+    }
+
     let success = 0;
     let failed = 0;
-    for (const file of files) {
+    for (const file of stillUnused) {
       try {
         await this.app.fileManager.trashFile(file);
         success++;
@@ -1119,9 +3188,12 @@ refreshRibbonIcon() {
         console.error(`${PLUGIN_DISPLAY_NAME}: 删除未引用图片失败`, file.path, err);
       }
     }
+
     this.lastUnusedImageScan = await this.scanUnusedImages();
     await this.refreshUnusedImageViews();
-    new Notice(`已移入回收站 ${success} 张图片${failed ? `，失败 ${failed} 张` : ''}。`);
+
+    const protectedText = reProtected.length ? `，重新检查后跳过 ${reProtected.length} 张` : '';
+    new Notice(`已移入回收站 ${success} 张图片${protectedText}${failed ? `，失败 ${failed} 张` : ''}。`);
   }
 
   async handleCreatedFile(file) {
@@ -1133,6 +3205,316 @@ refreshRibbonIcon() {
     const shouldHandle = isPastedImage(file) || (this.settings.handleAllAttachments && !this.testExcludeExtension(file));
     if (!shouldHandle) return;
     await this.startRenameProcess(file, this.settings.autoRename);
+  }
+
+  resolveReadingImageContext(img) {
+    if (!(img instanceof HTMLImageElement)) return null;
+
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const activeFile = view?.file;
+    if (!(activeFile instanceof TFile)) return null;
+
+    // 只处理阅读模式，不劫持 Live Preview 自己的交互。
+    if (!img.closest('.markdown-preview-view')) return null;
+
+    const previewRoot = img.closest('.markdown-preview-view');
+    const allImages = Array.from(previewRoot?.querySelectorAll('img') || [])
+      .filter((node) => node instanceof HTMLImageElement && !node.closest('.iwt-reading-image-viewer'));
+    const domIndex = Math.max(0, allImages.indexOf(img));
+
+    return {
+      img,
+      activeFile,
+      domIndex,
+      src: img.currentSrc || img.src || '',
+      alt: img.alt || '',
+    };
+  }
+
+  async findReadingImageSourceItem(context) {
+    if (!context?.activeFile) return null;
+    const content = await this.app.vault.cachedRead(context.activeFile);
+    const items = this.parseImageEmbedsFromContent(context.activeFile, content);
+
+    // 优先用阅读视图中的图片顺序对应源码图片顺序；
+    // 若主题额外插入装饰图片，则再按资源 URL / 文件名回退。
+    if (items[context.domIndex]) return items[context.domIndex];
+
+    const src = String(context.src || '');
+    const basenameFromUrl = decodeURIComponent(src.split('/').pop()?.split('?')[0] || '').toLowerCase();
+    if (basenameFromUrl) {
+      const matched = items.filter((item) =>
+        item.file instanceof TFile
+        && item.file.name.toLowerCase() === basenameFromUrl
+      );
+      if (matched.length === 1) return matched[0];
+    }
+
+    return items.length === 1 ? items[0] : null;
+  }
+
+  async updateReadingImageSourceLine(activeFile, item, updater, logType = 'reading-image-viewer') {
+    if (!(activeFile instanceof TFile) || !item) return false;
+
+    const beforeContent = await this.app.vault.cachedRead(activeFile);
+    const lines = beforeContent.split('\n');
+    const lineNumber = Number(item.line ?? item.lineNumber ?? -1);
+    if (lineNumber < 0 || lineNumber >= lines.length) {
+      new Notice('无法定位图片源码行');
+      return false;
+    }
+
+    const currentLine = lines[lineNumber];
+    const nextLine = updater(currentLine);
+    if (typeof nextLine !== 'string' || nextLine === currentLine) return false;
+
+    lines[lineNumber] = nextLine;
+    const afterContent = lines.join('\n');
+    await this.app.vault.modify(activeFile, afterContent);
+
+    await this.writeOperationLog({
+      type: logType,
+      createdAt: new Date().toISOString(),
+      renames: [],
+      notes: [{ path: activeFile.path, beforeContent, afterContent }],
+    });
+
+    return true;
+  }
+
+  async setReadingImageWidth(context, item, width) {
+    const normalized = normalizeImageSize(width);
+    if (!normalized) return false;
+
+    const ok = await this.updateReadingImageSourceLine(
+      context.activeFile,
+      item,
+      (line) => {
+        const regex = createImageLinkRegex('g');
+        let count = -1;
+        return line.replace(regex, (full) => {
+          count++;
+          // 同一行多图时，使用字符区间寻找当前 item
+          if (item.from !== undefined && item.to !== undefined) {
+            const start = line.indexOf(full);
+            if (start !== item.from && full !== item.fullMatch) return full;
+          } else if (full !== item.fullMatch) {
+            return full;
+          }
+          return applyImageSizeToWikiEmbed(full, normalized);
+        });
+      },
+      'reading-set-size'
+    );
+
+    if (ok) new Notice(`已设置图片宽度 ${normalized}px`);
+    return ok;
+  }
+
+  async setReadingImageRotation(context, item, rotation) {
+    const ok = await this.updateReadingImageSourceLine(
+      context.activeFile,
+      item,
+      (line) => applyImageRotationToLine(line, rotation),
+      'reading-set-rotation'
+    );
+    if (ok) new Notice(`已设置图片旋转 ${((Number(rotation) % 360) + 360) % 360}°`);
+    return ok;
+  }
+
+  async editReadingImageTitle(context, item) {
+    const file = context.activeFile;
+    if (!(file instanceof TFile)) return;
+
+    // 打开当前图片所在源码行，再复用现有标题编辑器，避免维护第二套标题写回逻辑。
+    const focused = await this.focusImageSourceLine(file, item.line, item.from || 0);
+    if (!focused) return;
+
+    const editor = this.getActiveEditor();
+    if (!editor) return;
+    const line = editor.getLine(item.line) || '';
+    const embed = this.findFirstEmbedInLine(file, line, item.line, item.file || null);
+    if (!embed) {
+      new Notice('无法定位图片标题源码');
+      return;
+    }
+    this.openImageDescriptionModal(embed);
+  }
+
+  async revealImageFileInNavigator(file) {
+    if (!(file instanceof TFile)) {
+      new Notice('无法定位图片文件');
+      return false;
+    }
+
+    // 优先使用 Obsidian 文件列表的 revealInFolder；不同版本不可用时回退为打开图片文件。
+    const leaves = this.app.workspace.getLeavesOfType('file-explorer');
+    for (const leaf of leaves) {
+      const view = leaf?.view;
+      if (view && typeof view.revealInFolder === 'function') {
+        try {
+          await view.revealInFolder(file);
+          this.app.workspace.revealLeaf(leaf);
+          return true;
+        } catch (err) {}
+      }
+    }
+
+    try {
+      const leaf = this.app.workspace.getLeaf('tab');
+      await leaf.openFile(file);
+      return true;
+    } catch (err) {
+      console.error(`${PLUGIN_DISPLAY_NAME}: 定位图片文件失败`, err);
+      new Notice('无法在文件列表定位图片');
+      return false;
+    }
+  }
+
+  async copyImagePath(file) {
+    if (!(file instanceof TFile)) {
+      new Notice('没有可复制的图片路径');
+      return false;
+    }
+    try {
+      await navigator.clipboard.writeText(file.path);
+      new Notice('已复制图片路径');
+      return true;
+    } catch (err) {
+      new Notice('复制路径失败');
+      return false;
+    }
+  }
+
+  async copyImageWikiLink(file) {
+    if (!(file instanceof TFile)) {
+      new Notice('没有可复制的图片链接');
+      return false;
+    }
+    try {
+      await navigator.clipboard.writeText(`![[${file.path}]]`);
+      new Notice('已复制图片 Wiki 链接');
+      return true;
+    } catch (err) {
+      new Notice('复制 Wiki 链接失败');
+      return false;
+    }
+  }
+
+  async getReadingViewerItems(activeFile) {
+    if (!(activeFile instanceof TFile)) return [];
+    const content = await this.app.vault.cachedRead(activeFile);
+    return this.parseImageEmbedsFromContent(activeFile, content)
+      .filter((item) => item && !item.external);
+  }
+
+  async openAdjacentReadingImageViewer(context, item, delta) {
+    const items = await this.getReadingViewerItems(context.activeFile);
+    if (!items.length) return;
+
+    const currentIndex = items.findIndex((candidate) =>
+      candidate.line === item.line
+      && candidate.from === item.from
+      && candidate.fullMatch === item.fullMatch
+    );
+
+    const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = safeIndex + delta;
+    if (nextIndex < 0 || nextIndex >= items.length) {
+      new Notice(delta < 0 ? '已经是第一张图片' : '已经是最后一张图片');
+      return;
+    }
+
+    const nextItem = items[nextIndex];
+    const nextFile = nextItem.file instanceof TFile ? nextItem.file : null;
+    const nextSrc = nextFile
+      ? this.app.vault.getResourcePath(nextFile)
+      : context.src;
+
+    const content = await this.app.vault.cachedRead(context.activeFile);
+    const line = content.split('\n')[nextItem.line] || '';
+    const nextContext = {
+      activeFile: context.activeFile,
+      img: null,
+      domIndex: nextIndex,
+      src: nextSrc,
+      alt: nextFile?.name || nextItem.basename || '',
+    };
+
+    new ReadingImageViewerModal(
+      this.app,
+      this,
+      nextContext,
+      nextItem,
+      {
+        rotation: getImageRotationFromLine(line),
+        width: nextItem.hasSize
+          ? String(nextItem.size || '')
+          : String(this.settings.uniformSizeDefault || '500'),
+      }
+    ).open();
+  }
+
+  async openReadingImageViewer(context) {
+    const item = await this.findReadingImageSourceItem(context);
+    if (!item) {
+      new Notice('无法确定这张图片对应的源码位置');
+      return;
+    }
+
+    const content = await this.app.vault.cachedRead(context.activeFile);
+    const line = content.split('\n')[item.line] || '';
+    const initialRotation = getImageRotationFromLine(line);
+    const initialWidth = item.hasSize ? String(item.size || '') : String(this.settings.uniformSizeDefault || '500');
+
+    new ReadingImageViewerModal(
+      this.app,
+      this,
+      context,
+      item,
+      {
+        rotation: initialRotation,
+        width: initialWidth,
+      }
+    ).open();
+  }
+
+  registerReadingModeImageViewer() {
+    const handle = async (event) => {
+      const viewer = this.settings.readingViewer || {};
+      if (viewer.enabled === false) return;
+
+      const target = event.target;
+      if (!(target instanceof HTMLImageElement)) return;
+
+      const isDouble =
+        event.type === 'dblclick'
+        && viewer.openOnDoubleClick !== false;
+
+      const modifierMatched =
+        viewer.modifierKey === 'ctrl'
+          ? event.ctrlKey
+          : viewer.modifierKey === 'meta'
+            ? event.metaKey
+            : (event.ctrlKey || event.metaKey);
+
+      const isModifiedClick =
+        event.type === 'click'
+        && viewer.openOnModifierClick !== false
+        && modifierMatched;
+
+      if (!isDouble && !isModifiedClick) return;
+
+      const context = this.resolveReadingImageContext(target);
+      if (!context) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      await this.openReadingImageViewer(context);
+    };
+
+    this.registerDomEvent(this.app.workspace.containerEl, 'dblclick', handle);
+    this.registerDomEvent(this.app.workspace.containerEl, 'click', handle);
   }
 
   getActiveFile() {
@@ -1582,8 +3964,17 @@ refreshRibbonIcon() {
           fullMatch: item.fullMatch,
           imageIndex,
         });
+        item.cleanable = Boolean(decision.ok);
         if (decision.ok) cleanable++;
+      } else {
+        item.cleanable = false;
       }
+
+      if (item.status.includes('缺失文件') || item.status.includes('同名风险')) item.severity = 'high';
+      else if (item.status.includes('无尺寸') || item.status.includes('重复引用')) item.severity = 'warning';
+      else if (item.external || item.cleanable) item.severity = 'info';
+      else item.severity = 'ok';
+
       if (item.status.length === 0) normal++;
     }
     const hasHighRisk = missing > 0 || sameNameRisk > 0;
@@ -1591,6 +3982,240 @@ refreshRibbonIcon() {
       ? `存在高风险项：缺失文件 ${missing} 个，同名风险 ${sameNameRisk} 个。建议先体检修复，再执行清洗或归档。`
       : `未发现高风险项。可优先处理无尺寸图片 ${noSize} 个、可安全清洗链接 ${cleanable} 个。`;
     return { activeFile, total: items.length, normal, missing, noSize, duplicates, sameNameRisk, external, cleanable, items, hasHighRisk, riskLevel };
+  }
+
+  async focusImageSourceLine(activeFile, lineNumber, ch = 0) {
+    if (!(activeFile instanceof TFile)) {
+      new Notice('无法定位：笔记文件不存在');
+      return false;
+    }
+
+    let view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view || view.file?.path !== activeFile.path) {
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(activeFile);
+      await sleep(60);
+      view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    }
+
+    const editor = view?.editor;
+    if (!editor) {
+      new Notice('无法定位：当前编辑器不可用');
+      return false;
+    }
+
+    const maxLine = Math.max(0, editor.lineCount() - 1);
+    const line = Math.max(0, Math.min(maxLine, Number(lineNumber) || 0));
+    const text = editor.getLine(line) || '';
+    const column = Math.max(0, Math.min(text.length, Number(ch) || 0));
+
+    editor.setCursor({ line, ch: column });
+    if (typeof editor.scrollIntoView === 'function') {
+      editor.scrollIntoView(
+        { from: { line, ch: 0 }, to: { line, ch: text.length } },
+        true
+      );
+    }
+    editor.focus();
+    return true;
+  }
+
+  async setImageSizeAtSourceLine(activeFile, item, sizeValue = '') {
+    const ok = await this.focusImageSourceLine(activeFile, item?.line ?? item?.lineNumber ?? 0, item?.from ?? 0);
+    if (!ok) return false;
+
+    const editor = this.getActiveEditor();
+    if (!editor) return false;
+
+    const lineNumber = Number(item?.line ?? item?.lineNumber ?? 0);
+    const lineText = editor.getLine(lineNumber) || '';
+    let embed = this.findFirstEmbedInLine(activeFile, lineText, lineNumber, item?.file || null);
+
+    // 缺失文件或外部图片没有 targetFile，可用原始文本精确定位。
+    if (!embed && item?.fullMatch) {
+      const from = lineText.indexOf(item.fullMatch);
+      if (from >= 0) {
+        const match = createImageLinkRegex('g').exec(lineText.slice(from));
+        if (match) {
+          match.index = from;
+          embed = makeImageLinkItemFromMatch(match, lineText, lineNumber, activeFile, this.app);
+        }
+      }
+    }
+
+    if (!embed) {
+      new Notice('未找到对应图片源码');
+      return false;
+    }
+
+    const normalized = normalizeImageSize(sizeValue || this.settings.uniformSizeDefault || '500');
+    if (!normalized) {
+      new Notice('默认图片宽度为空');
+      return false;
+    }
+    return await this.setCurrentLineImageSize(normalized, embed);
+  }
+
+  openImageDescriptionModal(lineEmbed = null) {
+    const activeFile = this.getActiveFile();
+    if (!activeFile) {
+      new Notice('未找到当前笔记');
+      return;
+    }
+    const embed = lineEmbed || this.findCurrentLineFirstEmbed(activeFile);
+    if (!embed) {
+      new Notice('当前行未检测到图片嵌入');
+      return;
+    }
+
+    const currentDescription = getImageDescriptionFromEmbed(embed.fullMatch);
+    const editor = this.getActiveEditor();
+    const currentLine = editor ? (editor.getLine(embed.lineNumber) || '') : '';
+    const currentStyle = getImageCaptionStyleFromLine(currentLine);
+
+    new ImageDescriptionModal(this.app, currentDescription, currentStyle, async (payload) => {
+      await this.setCurrentLineImageDescription(payload, embed);
+    }).open();
+  }
+
+  openImageDescriptionModalAtLine(lineNumber, sourcePath = '', expectedLine = '') {
+    const activeFile = this.getActiveFile();
+    const editor = this.getActiveEditor();
+    if (!activeFile || !editor) {
+      new Notice('当前编辑器不可用');
+      return;
+    }
+    if (sourcePath && activeFile.path !== sourcePath) {
+      new Notice('当前笔记已切换，未修改图片说明');
+      return;
+    }
+
+    let resolvedLine = Number.isInteger(lineNumber) ? lineNumber : -1;
+    let line = resolvedLine >= 0 ? (editor.getLine(resolvedLine) || '') : '';
+
+    // Block Widget 可能因 CodeMirror 重绘导致旧行号失配：
+    // 先比对源文本，不一致时在附近搜索，再退化到全篇唯一匹配。
+    const expected = String(expectedLine || '').trim();
+    if (expected && line.trim() !== expected) {
+      const lineCount = editor.lineCount();
+      const nearby = [];
+      if (resolvedLine >= 0) {
+        for (let delta = 1; delta <= 8; delta += 1) {
+          if (resolvedLine - delta >= 0) nearby.push(resolvedLine - delta);
+          if (resolvedLine + delta < lineCount) nearby.push(resolvedLine + delta);
+        }
+      }
+      let found = nearby.find((candidate) => String(editor.getLine(candidate) || '').trim() === expected);
+      if (found === undefined) {
+        const matches = [];
+        for (let i = 0; i < lineCount; i += 1) {
+          if (String(editor.getLine(i) || '').trim() === expected) matches.push(i);
+        }
+        if (matches.length === 1) found = matches[0];
+      }
+      if (found !== undefined) {
+        resolvedLine = found;
+        line = editor.getLine(found) || '';
+      }
+    }
+
+    let embed = resolvedLine >= 0
+      ? this.findFirstEmbedInLine(activeFile, line, resolvedLine)
+      : null;
+
+    // 如果精确文本已经变化，再用图片目标文件进行回退定位。
+    if (!embed && expected) {
+      const expectedMatch = createImageLinkRegex('g').exec(expected);
+      if (expectedMatch) {
+        const parsed = parseImageLinkMatch(expectedMatch);
+        const target = parsed?.rawTarget || '';
+        if (target) {
+          const file = this.app.metadataCache.getFirstLinkpathDest(target, activeFile.path);
+          if (file) {
+            embed = this.findEmbedForFileInEditor(activeFile, file, Math.max(0, resolvedLine));
+          }
+        }
+      }
+    }
+
+    if (!embed) {
+      new Notice('未找到对应图片源码；请把光标放到该图片所在行后再试');
+      return;
+    }
+    this.openImageDescriptionModal(embed);
+  }
+
+  async setCurrentLineImageDescription(payload, lineEmbed = null) {
+    const editor = this.getActiveEditor();
+    const activeFile = this.getActiveFile();
+    if (!editor || !activeFile) return false;
+
+    const data = (payload && typeof payload === 'object')
+      ? payload
+      : { description: String(payload || ''), color: '', size: '' };
+
+    const descriptionValue = String(data.description || '').trim();
+
+    const beforeContent = this.getEditorContent(editor, activeFile);
+    let embed = lineEmbed || this.findCurrentLineFirstEmbed(activeFile);
+    if (!embed) {
+      new Notice('当前行未检测到图片嵌入');
+      return false;
+    }
+
+    let currentLine = editor.getLine(embed.lineNumber) || '';
+    if (currentLine.slice(embed.from, embed.to) !== embed.fullMatch) {
+      const resolved = this.findEmbedForFileInEditor(activeFile, embed.file, embed.lineNumber)
+        || this.findEmbedByTextFallback(activeFile, embed.file, embed.lineNumber);
+      if (resolved) {
+        embed = resolved;
+        currentLine = editor.getLine(embed.lineNumber) || '';
+      }
+    }
+
+    const finalLinkText = applyImageDescriptionToEmbed(embed.fullMatch, descriptionValue);
+    const linkUpdatedLine =
+      currentLine.slice(0, embed.from)
+      + finalLinkText
+      + currentLine.slice(embed.to);
+
+    const finalLine = applyImageCaptionStyleToLine(linkUpdatedLine, {
+      color: data.color,
+      size: data.size,
+    });
+
+    if (finalLine === currentLine) {
+      new Notice('图片标题未变化');
+      return false;
+    }
+
+    if (typeof editor.replaceRange !== 'function') {
+      new Notice('图片标题写入失败：编辑器不支持替换操作');
+      return false;
+    }
+
+    editor.replaceRange(
+      finalLine,
+      { line: embed.lineNumber, ch: 0 },
+      { line: embed.lineNumber, ch: currentLine.length }
+    );
+
+    await sleep(80);
+    const afterContent = this.getEditorContent(editor, activeFile);
+    if (afterContent === beforeContent || !afterContent.includes(finalLine)) {
+      new Notice('图片标题写入失败：未能确认正文已更新');
+      return false;
+    }
+
+    await this.writeOperationLog({
+      type: 'set-image-description',
+      createdAt: new Date().toISOString(),
+      notes: [{ path: activeFile.path, beforeContent, afterContent }],
+      renames: [],
+    });
+
+    new Notice(descriptionValue ? '已更新图片标题' : '已清除图片标题');
+    return true;
   }
 
   async setCurrentLineImageSize(sizeValue, lineEmbed = null) {
@@ -2674,40 +5299,6 @@ refreshRibbonIcon() {
     await this.previewCleaning();
   }
 
-  async applyWorkflowMode(value) {
-    const mode = ['conservative', 'normal', 'aggressive'].includes(value) ? value : 'normal';
-    this.settings.workflowMode = mode;
-
-    if (mode === 'conservative') {
-      this.settings.autoRename = false;
-      this.settings.promptForPasteSize = true;
-      this.settings.requireUniqueFilename = true;
-      this.settings.requireFinalConfirmation = true;
-      this.settings.resequenceSkipDuplicateEmbeds = true;
-      this.settings.showRibbonIcon = true;
-    }
-
-    if (mode === 'normal') {
-      this.settings.autoRename = false;
-      this.settings.promptForPasteSize = true;
-      this.settings.requireUniqueFilename = true;
-      this.settings.requireFinalConfirmation = true;
-      this.settings.resequenceSkipDuplicateEmbeds = true;
-      this.settings.showRibbonIcon = true;
-    }
-
-    if (mode === 'aggressive') {
-      this.settings.autoRename = true;
-      this.settings.promptForPasteSize = false;
-      this.settings.requireUniqueFilename = false;
-      this.settings.requireFinalConfirmation = false;
-      this.settings.resequenceSkipDuplicateEmbeds = true;
-      this.settings.showRibbonIcon = true;
-    }
-
-    await this.saveSettings();
-    new Notice(`已切换为${mode === 'conservative' ? '保守模式' : mode === 'aggressive' ? '激进模式' : '常规模式'}`);
-  }
 
 }
 
@@ -2715,7 +5306,7 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this.activeTab = 'rename';
+    this.activeTab = 'paste';
   }
 
   display() {
@@ -2725,24 +5316,26 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
 
     const root = containerEl.createDiv({ cls: 'iwt-settings-shell' });
     const header = root.createDiv({ cls: 'iwt-settings-header' });
-    header.createEl('h2', { text: '🖼️ image-workflow' });
+    header.createEl('h2', { text: '🖼️ Image Workflow' });
     header.createDiv({
       cls: 'iwt-settings-header-note',
-      text: '图片命名、文章内重排与链接清洗的一体化工具。设置页采用分区面板 + 原生设置项结构，保留宽松间距与清晰入口。',
+      text: '图片命名、展示、整理与维护。',
     });
 
     const defs = [
-      ['rename', '📝 命名'],
-      ['resequence', '🔢 重排'],
-      ['clean', '🧹 清洗'],
-      ['unused', '🗑️ 未引用'],
-      ['scope', '📂 范围/入口'],
-      ['actions', '⚙️ 操作'],
+      ['paste', '📝 粘贴与命名'],
+      ['display', '🖼️ 尺寸与展示'],
+      ['organize', '🔢 重排与归档'],
+      ['clean', '🧹 链接清洗'],
+      ['unused', '🗑️ 未引用图片'],
     ];
 
     const tabs = root.createDiv({ cls: 'iwt-tabs' });
     for (const [key, label] of defs) {
-      const btn = tabs.createEl('button', { text: label, cls: `iwt-tab ${key === this.activeTab ? 'is-active' : ''}` });
+      const btn = tabs.createEl('button', {
+        text: label,
+        cls: `iwt-tab ${key === this.activeTab ? 'is-active' : ''}`,
+      });
       btn.onclick = () => {
         this.activeTab = key;
         this.display();
@@ -2758,12 +5351,14 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
       return section;
     };
 
-    if (this.activeTab === 'rename') {
-      const basic = makeSection('📝 基础命名', '基础命名规则。设置项采用原生列表结构，不使用设置项背景卡片。');
+    const addTemplateHelp = () => {};
 
-      new Setting(basic)
-        .setName('🏷️ 图片命名模板')
-        .setDesc('支持 {{fileName}}、{{dirName}}、{{imageNameKey}}、{{firstHeading}}、{{DATE:YYYYMMDD}}、{{frontmatter:key}}')
+    if (this.activeTab === 'paste') {
+      const naming = makeSection('✏️ 命名');
+
+      new Setting(naming)
+        .setName('图片命名模板')
+        .setDesc('决定新图片的文件名。')
         .addText((text) => text
           .setPlaceholder('{{fileName}}')
           .setValue(this.plugin.settings.imageNamePattern)
@@ -2771,11 +5366,104 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
             this.plugin.settings.imageNamePattern = value || '{{fileName}}';
             await this.plugin.saveSettings();
           }));
-      basic.createDiv({ cls: 'iwt-help', text: '模板变量：{{fileName}}/{{note}} 当前笔记名；{{heading}} 当前标题；{{firstHeading}} 首个一级标题；{{folder}} 当前文件夹；{{index}} 图片序号；{{DATE:YYYYMMDD}} 日期；{{frontmatter:key}} YAML 字段。' });
 
-      new Setting(basic)
-        .setName('📏 尺寸快捷预设')
-        .setDesc('逗号分隔，会显示在粘贴图片面板和尺寸设置面板中。')
+      addTemplateHelp(naming);
+
+      new Setting(naming)
+        .setName('自动重命名')
+        .setDesc('开启后直接按模板命名；关闭后先弹出命名窗口。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.autoRename)
+          .onChange(async (value) => {
+            this.plugin.settings.autoRename = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(naming)
+        .setName('写入链接形式')
+        .setDesc('选择重命名后写回笔记的图片链接路径。')
+        .addDropdown((dropdown) => dropdown
+          .addOption('short', '短链接')
+          .addOption('relative', '相对路径')
+          .addOption('full', '完整路径')
+          .setValue(this.plugin.settings.imageLinkMode || 'short')
+          .onChange(async (value) => {
+            this.plugin.settings.imageLinkMode = value;
+            await this.plugin.saveSettings();
+          }));
+
+      const attachments = makeSection('📎 附件处理');
+
+      new Setting(attachments)
+        .setName('处理全部新附件')
+        .setDesc('关闭时主要处理 Obsidian 生成的 Pasted image；开启后其他新附件也参与。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.handleAllAttachments)
+          .onChange(async (value) => {
+            this.plugin.settings.handleAllAttachments = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(attachments)
+        .setName('排除扩展名')
+        .setDesc('正则表达式，例如 pdf|mp4。命中的附件不处理。')
+        .addText((text) => text
+          .setPlaceholder('pdf|mp4')
+          .setValue(this.plugin.settings.excludeExtensionPattern || '')
+          .onChange(async (value) => {
+            this.plugin.settings.excludeExtensionPattern = value.trim();
+            await this.plugin.saveSettings();
+          }));
+
+      const duplicates = makeSection('🔢 重名编号');
+
+      new Setting(duplicates)
+        .setName('编号位置')
+        .setDesc('开启：1-图片.png；关闭：图片-1.png。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.dupNumberAtStart)
+          .onChange(async (value) => {
+            this.plugin.settings.dupNumberAtStart = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(duplicates)
+        .setName('编号分隔符')
+        .setDesc('默认使用 -。')
+        .addText((text) => text
+          .setValue(this.plugin.settings.dupNumberDelimiter)
+          .onChange(async (value) => {
+            this.plugin.settings.dupNumberDelimiter = sanitizeDelimiter(value);
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(duplicates)
+        .setName('始终追加编号')
+        .setDesc('即使没有重名，也按编号格式命名。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.dupNumberAlways)
+          .onChange(async (value) => {
+            this.plugin.settings.dupNumberAlways = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(duplicates)
+        .setName('隐藏重命名通知')
+        .setDesc('关闭重命名完成后的提示。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.disableRenameNotice)
+          .onChange(async (value) => {
+            this.plugin.settings.disableRenameNotice = value;
+            await this.plugin.saveSettings();
+          }));
+    }
+
+    if (this.activeTab === 'display') {
+      const size = makeSection('📐 图片宽度');
+
+      new Setting(size)
+        .setName('宽度快捷预设')
+        .setDesc('用于粘贴窗口、尺寸窗口和 Live Preview 悬停菜单。逗号分隔。')
         .addText((text) => text
           .setPlaceholder('300,400,500,600,800')
           .setValue(this.plugin.settings.quickSizePresets || '')
@@ -2784,121 +5472,196 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }));
 
-      new Setting(basic)
-        .setName('⚡ 自动重命名新粘贴图片')
-        .setDesc('关闭时，会弹出命名窗口。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.autoRename).onChange(async (value) => {
-          this.plugin.settings.autoRename = value;
-          await this.plugin.saveSettings();
-        }));
+      const currentDefault = String(
+        this.plugin.settings.uniformSizeDefault
+        || this.plugin.settings.pastedImageSize
+        || '500'
+      );
 
-      new Setting(basic)
-        .setName('📐 粘贴时弹出尺寸输入框')
-        .setDesc('开启后，每次粘贴图片都会出现尺寸输入框，可即时写入 ![[xxx.png|500]] 这类后缀。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.promptForPasteSize).onChange(async (value) => {
-          this.plugin.settings.promptForPasteSize = value;
-          await this.plugin.saveSettings();
-        }));
-
-      new Setting(basic)
-        .setName('🔢 默认尺寸')
-        .setDesc('作为尺寸输入框的默认值；关闭尺寸输入框时，也会直接作为插入后缀使用。')
+      new Setting(size)
+        .setName('默认图片宽度')
+        .setDesc('同时用于粘贴图片和统一尺寸操作；留空表示粘贴时不自动写宽度。')
         .addText((text) => text
-          .setPlaceholder('例如 500')
-          .setValue(String(this.plugin.settings.pastedImageSize || ''))
+          .setPlaceholder('500')
+          .setValue(currentDefault)
           .onChange(async (value) => {
-            this.plugin.settings.pastedImageSize = normalizeImageSize(value);
+            const normalized = normalizeImageSize(value);
+            this.plugin.settings.pastedImageSize = normalized;
+            this.plugin.settings.uniformSizeDefault = normalized || '500';
             await this.plugin.saveSettings();
           }));
 
-      new Setting(basic)
-        .setName('🔗 粘贴重写链接模式')
-        .setDesc('控制粘贴图片重命名后写入正文的链接形态。短链接最简洁；相对路径便于随笔记迁移；完整路径最稳定。')
+      new Setting(size)
+        .setName('粘贴时询问宽度')
+        .setDesc('开启后，每次粘贴图片时可确认或修改宽度。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.promptForPasteSize)
+          .onChange(async (value) => {
+            this.plugin.settings.promptForPasteSize = value;
+            await this.plugin.saveSettings();
+          }));
+
+      const live = makeSection('🖱️ 图片交互');
+
+      const readingViewer = makeSection('🔍 阅读模式图片查看器');
+
+      new Setting(readingViewer)
+        .setName('启用阅读模式图片查看器')
+        .setDesc('关闭阅读模式图片查看器。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.readingViewer?.enabled !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.readingViewer.enabled = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(readingViewer)
+        .setName('双击打开')
+        .setDesc('双击图片打开查看器。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.readingViewer?.openOnDoubleClick !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.readingViewer.openOnDoubleClick = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(readingViewer)
+        .setName('快捷键点击打开')
+        .setDesc('Ctrl / Cmd + 点击打开查看器。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.readingViewer?.openOnModifierClick !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.readingViewer.openOnModifierClick = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(readingViewer)
+        .setName('快捷修饰键')
+        .setDesc('选择快捷修饰键。')
         .addDropdown((dropdown) => dropdown
-          .addOption('short', '短链接：![[图片.png|500]]')
-          .addOption('relative', '相对路径：![[../assets/图片.png|500]]')
-          .addOption('full', '完整路径：![[附件/assets/图片.png|500]]')
-          .setValue(this.plugin.settings.imageLinkMode || 'short')
+          .addOption('mod', 'Mod（Ctrl / Cmd）')
+          .addOption('ctrl', '仅 Ctrl')
+          .addOption('meta', '仅 Cmd / Meta')
+          .setValue(this.plugin.settings.readingViewer?.modifierKey || 'mod')
           .onChange(async (value) => {
-            this.plugin.settings.imageLinkMode = value;
+            this.plugin.settings.readingViewer.modifierKey = value;
             await this.plugin.saveSettings();
           }));
 
-      const attachment = makeSection('📎 附件处理', '限定是否仅处理系统生成的 Pasted image 文件。');
+      const viewerTools = makeSection('🧰 查看器功能');
 
-      new Setting(attachment)
-        .setName('🗂️ 处理全部新附件')
-        .setDesc('开启后，拖入或新增的非 Markdown 文件也会参与自动命名。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.handleAllAttachments).onChange(async (value) => {
-          this.plugin.settings.handleAllAttachments = value;
-          await this.plugin.saveSettings();
-        }));
+      const toolDefs = [
+        ['allowZoom', '预览缩放', '查看器内缩放，不写回正文。'],
+        ['allowWidth', '正文宽度', '修改并写回图片宽度。'],
+        ['allowRotate', '旋转', '旋转并写回 {rotate=...}。'],
+        ['allowTitle', '图片标题', '修改标题、颜色、字号和局部格式。'],
+        ['allowSourceLocate', '定位 Markdown 源码', '跳到对应图片源码行。'],
+        ['allowFileLocate', '定位图片文件', '在 Obsidian 文件列表中定位图片文件。'],
+        ['allowCopyPath', '复制图片路径', '提供复制 Vault 路径和 Wiki 链接按钮。'],
+        ['allowNavigation', '上一张 / 下一张', '在当前笔记图片之间切换。'],
+      ];
 
-      new Setting(attachment)
-        .setName('🚫 排除扩展名正则')
-        .setDesc('例如 pdf|mp4；命中的扩展名不会被自动处理。')
-        .addTextArea((text) => {
-          text.setPlaceholder('pdf|mp4')
-            .setValue(this.plugin.settings.excludeExtensionPattern)
+      for (const [key, name, desc] of toolDefs) {
+        new Setting(viewerTools)
+          .setName(name)
+          .setDesc(desc)
+          .addToggle((toggle) => toggle
+            .setValue(this.plugin.settings.readingViewer?.[key] !== false)
             .onChange(async (value) => {
-              this.plugin.settings.excludeExtensionPattern = value.trim();
+              this.plugin.settings.readingViewer[key] = value;
               await this.plugin.saveSettings();
-            });
-          text.inputEl.rows = 3;
-        });
+            }));
+      }
 
-      const duplicate = makeSection('🔁 重复编号', '当目标名称冲突时，控制编号位置与分隔符。');
+      const syntax = makeSection('🖼️ 图片说明与网格');
+      const examples = syntax.createEl('pre', { cls: 'iwt-display-code' });
+      examples.setText([
+        '![[图片.png]]',
+        '![[图片.png|500]]',
+        '![[图片.png|这是**说明**|500]]',
+      ].join('\n'));
 
-      new Setting(duplicate)
-        .setName('↔️ 编号放在开头')
-        .setDesc('开启后形如 1-文件名.png；关闭后形如 文件名-1.png。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.dupNumberAtStart).onChange(async (value) => {
-          this.plugin.settings.dupNumberAtStart = value;
-          await this.plugin.saveSettings();
-        }));
+      syntax.createDiv({
+        cls: 'iwt-help',
+        text: '使用 cssclasses: image-grid 时，连续图片按空行分组并自动排列；Live Preview 会显示图片编号。img-grid / img-grid-3 / img-grid-4 继续兼容，并允许网格整体横向超出正文。',
+      });
 
-      new Setting(duplicate)
-        .setName('➖ 编号分隔符')
-        .setDesc('默认为 - 。')
-        .addText((text) => text.setValue(this.plugin.settings.dupNumberDelimiter).onChange(async (value) => {
-          this.plugin.settings.dupNumberDelimiter = sanitizeDelimiter(value);
-          await this.plugin.saveSettings();
-        }));
+      const batchSize = makeSection('批量尺寸', '统一当前笔记图片的 Wiki 宽度；可选择只处理无尺寸图片或其他范围。');
 
-      new Setting(duplicate)
-        .setName('➕ 始终追加编号')
-        .setDesc('开启后，即使没有冲突，也会追加重复编号格式。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.dupNumberAlways).onChange(async (value) => {
-          this.plugin.settings.dupNumberAlways = value;
-          await this.plugin.saveSettings();
-        }));
+      new Setting(batchSize)
+        .setName('统一当前笔记图片宽度')
+        .setDesc('打开批量尺寸窗口，执行前由你选择宽度和处理范围。')
+        .addButton((btn) => btn
+          .setButtonText('统一尺寸')
+          .onClick(() => {
+            new UniformSizeModal(
+              this.plugin.app,
+              this.plugin.settings.uniformSizeDefault || '500',
+              async ({ sizeValue, scope }) => {
+                await this.plugin.uniformCurrentNoteImageSize(sizeValue, scope);
+              },
+              this.plugin.getSizePresets()
+            ).open();
+          }));
 
-      const feedback = makeSection('🔔 反馈', '控制提示信息与界面打断程度。');
+      const actions = makeSection('当前图片', '无需进入命令面板即可修改光标所在行的第一张图片。');
 
-      new Setting(feedback)
-        .setName('🔕 关闭重命名通知')
-        .setDesc('开启后，不再弹出 Renamed 提示。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.disableRenameNotice).onChange(async (value) => {
-          this.plugin.settings.disableRenameNotice = value;
-          await this.plugin.saveSettings();
-        }));
+      new Setting(actions)
+        .setName('修改宽度')
+        .setDesc('只改 Wiki 宽度，不重命名图片。')
+        .addButton((btn) => btn
+          .setButtonText('设置宽度')
+          .setCta()
+          .onClick(() => {
+            const file = this.plugin.getActiveFile();
+            const embed = file ? this.plugin.findCurrentLineFirstEmbed(file) : null;
+            if (!embed) {
+              new Notice('当前行未检测到图片');
+              return;
+            }
+            new SizeModal(
+              this.plugin.app,
+              this.plugin.settings.uniformSizeDefault || '500',
+              async (sizeValue) => {
+                await this.plugin.setCurrentLineImageSize(sizeValue, embed);
+              },
+              this.plugin.getSizePresets()
+            ).open();
+          }));
+
+      new Setting(actions)
+        .setName('修改说明')
+        .setDesc('修改 ![[图片.png|说明|500]] 中的说明，不改变图片文件名。')
+        .addButton((btn) => btn
+          .setButtonText('修改说明')
+          .onClick(() => {
+            const file = this.plugin.getActiveFile();
+            const embed = file ? this.plugin.findCurrentLineFirstEmbed(file) : null;
+            if (!embed) {
+              new Notice('当前行未检测到图片');
+              return;
+            }
+            this.plugin.openImageDescriptionModal(embed);
+          }));
     }
 
-    if (this.activeTab === 'resequence') {
-      const section = makeSection('🔢 当前文章图片重排', '按正文中的出现顺序重新整理图片文件名。');
+    if (this.activeTab === 'organize') {
+      const sequence = makeSection('🔢 当前笔记重排');
 
-      new Setting(section)
-        .setName('🏁 起始编号')
-        .setDesc('第一张图片的编号。')
-        .addText((text) => text.setValue(String(this.plugin.settings.resequenceStartNumber)).onChange(async (value) => {
-          const num = Number(value);
-          this.plugin.settings.resequenceStartNumber = Number.isFinite(num) && num > 0 ? Math.floor(num) : 1;
-          await this.plugin.saveSettings();
-        }));
+      new Setting(sequence)
+        .setName('起始编号')
+        .setDesc('决定当前笔记第一张图片从几开始编号，例如 1、10、100。')
+        .addText((text) => text
+          .setValue(String(this.plugin.settings.resequenceStartNumber))
+          .onChange(async (value) => {
+            const n = Number(value);
+            this.plugin.settings.resequenceStartNumber = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+            await this.plugin.saveSettings();
+          }));
 
-      new Setting(section)
-        .setName('🧭 重排命名模式')
-        .setDesc('重排优先按当前命名模板生成；只有旧图名不是插件生成名时，保留语义模式才会追加旧短名。')
+      new Setting(sequence)
+        .setName('命名方式')
+        .setDesc('保留语义：在新名称中尽量保留原图片名信息；纯编号：只按顺序编号。两种模式都会真正重命名图片文件。')
         .addDropdown((dropdown) => dropdown
           .addOption('semantic', '保留语义')
           .addOption('number', '纯编号')
@@ -2908,9 +5671,9 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }));
 
-      new Setting(section)
-        .setName('🔢 编号位数')
-        .setDesc('默认 1 表示 1、2；如需 01、02 可手动设为 2。')
+      new Setting(sequence)
+        .setName('编号位数')
+        .setDesc('控制补零格式。1 表示 1、2；2 表示 01、02；3 表示 001、002。')
         .addText((text) => text
           .setValue(String(this.plugin.settings.resequenceNumberPadding || 1))
           .onChange(async (value) => {
@@ -2919,9 +5682,31 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }));
 
-      new Setting(section)
-        .setName('📦 归档文件夹模板')
-        .setDesc('当前笔记图片归档时使用，例如 {{fileName}}.assets。')
+      new Setting(sequence)
+        .setName('跳过重复嵌入')
+        .setDesc('同一图片在当前笔记中重复引用时，只重命名文件一次，避免重复处理。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.resequenceSkipDuplicateEmbeds)
+          .onChange(async (value) => {
+            this.plugin.settings.resequenceSkipDuplicateEmbeds = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(sequence)
+        .setName('执行前显示摘要')
+        .setDesc('执行重排前显示处理数量与范围，便于确认是否符合预期。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.resequenceShowPreviewNotice)
+          .onChange(async (value) => {
+            this.plugin.settings.resequenceShowPreviewNotice = value;
+            await this.plugin.saveSettings();
+          }));
+
+      const archive = makeSection('📦 归档');
+
+      new Setting(archive)
+        .setName('归档文件夹模板')
+        .setDesc('定义当前笔记图片的目标附件目录，例如 {{fileName}}.assets。归档会移动真实图片文件。')
         .addText((text) => text
           .setValue(this.plugin.settings.archiveFolderPattern || '{{fileName}}.assets')
           .onChange(async (value) => {
@@ -2929,168 +5714,145 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }));
 
-      new Setting(section)
-        .setName('⏭️ 跳过重复嵌入')
-        .setDesc('同一张图片在正文中多次出现时，只重命名一次。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.resequenceSkipDuplicateEmbeds).onChange(async (value) => {
-          this.plugin.settings.resequenceSkipDuplicateEmbeds = value;
-          await this.plugin.saveSettings();
-        }));
 
-      new Setting(section)
-        .setName('👁️ 显示预览通知')
-        .setDesc('执行重排前显示摘要提示。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.resequenceShowPreviewNotice).onChange(async (value) => {
-          this.plugin.settings.resequenceShowPreviewNotice = value;
-          await this.plugin.saveSettings();
-        }));
+      const previewActions = makeSection('👀 预览与执行');
+
+      new Setting(previewActions)
+        .setName('预览图片重排')
+        .setDesc('显示旧文件名 → 新文件名 → 预计链接；存在路径冲突时禁止执行。')
+        .addButton((btn) => btn
+          .setButtonText('重排预览')
+          .setCta()
+          .onClick(async () => {
+            const file = this.plugin.getActiveFile();
+            if (!file) {
+              new Notice('未找到当前笔记');
+              return;
+            }
+            const plan = await this.plugin.buildResequencePlan(file);
+            if (!plan.tasks.length) {
+              new Notice('当前笔记没有可重排图片');
+              return;
+            }
+            this.plugin.openResequencePreview(
+              plan,
+              async () => await this.plugin.executeResequencePlan(plan, file)
+            );
+          }));
+
+      new Setting(previewActions)
+        .setName('预览图片归档')
+        .setDesc('显示图片将移动到的目标路径；确认后才会真正移动文件并更新链接。')
+        .addButton((btn) => btn
+          .setButtonText('归档预览')
+          .onClick(async () => {
+            const file = this.plugin.getActiveFile();
+            if (!file) {
+              new Notice('未找到当前笔记');
+              return;
+            }
+            const plan = await this.plugin.buildArchivePlan(file);
+            if (!plan.tasks.length) {
+              new Notice('当前笔记没有可归档图片');
+              return;
+            }
+            this.plugin.openResequencePreview(
+              plan,
+              async () => await this.plugin.executeArchivePlan(plan, file)
+            );
+          }));
+
+      const health = makeSection('图片体检与恢复', '集中检查当前笔记的缺失图片、尺寸状态、重复引用和可清洗项；修改操作可通过插件日志撤销。');
+
+      new Setting(health)
+        .setName('检查当前笔记图片')
+        .setDesc('生成图片健康报告，不会自动修改文件。可在报告中查看问题并执行对应修复。')
+        .addButton((btn) => btn
+          .setButtonText('打开图片体检')
+          .setCta()
+          .onClick(async () => {
+            const file = this.plugin.getActiveFile();
+            if (!file) {
+              new Notice('未找到当前笔记');
+              return;
+            }
+            const report = await this.plugin.buildCurrentNoteImageHealthReport(file);
+            new NoteHealthModal(this.plugin.app, report, this.plugin).open();
+          }));
+
+      new Setting(health)
+        .setName('撤销上一次工作流操作')
+        .setDesc('根据插件日志恢复最近一次命名、尺寸、重排、归档或清洗操作。')
+        .addButton((btn) => btn
+          .setButtonText('撤销上一次')
+          .onClick(async () => {
+            await this.plugin.rollbackLastOperation();
+          }));
     }
 
     if (this.activeTab === 'clean') {
-      const rules = makeSection('🧹 清洗规则', '把路径型图片嵌入安全收缩为文件名嵌入。范围与侧边栏图标在下一个“范围/入口”标签中设置。');
+      const rules = makeSection('🧹 链接清洗');
 
       new Setting(rules)
-        .setName('🖼️ 清洗 Wiki 图片嵌入')
-        .setDesc('例如 ![[folder/a.png|300]] → ![[a.png|300]]')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.cleanWikiEmbeds).onChange(async (value) => {
-          this.plugin.settings.cleanWikiEmbeds = value;
-          await this.plugin.saveSettings();
-        }));
+        .setName('清洗 Wiki 图片')
+        .setDesc('把带路径的 Wiki 图片链接缩短为文件名链接，例如 ![[folder/a.png|500]] → ![[a.png|500]]。图片文件本身不移动。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.cleanWikiEmbeds)
+          .onChange(async (value) => {
+            this.plugin.settings.cleanWikiEmbeds = value;
+            await this.plugin.saveSettings();
+          }));
 
       new Setting(rules)
-        .setName('🧾 清洗 Markdown 图片')
-        .setDesc('例如 ![](folder/a.png) → ![](a.png)')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.cleanMarkdownImages).onChange(async (value) => {
-          this.plugin.settings.cleanMarkdownImages = value;
-          await this.plugin.saveSettings();
-        }));
+        .setName('清洗 Markdown 图片')
+        .setDesc('把 Markdown 图片路径缩短为文件名，例如 ![](folder/a.png) → ![](a.png)。只改正文链接。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.cleanMarkdownImages)
+          .onChange(async (value) => {
+            this.plugin.settings.cleanMarkdownImages = value;
+            await this.plugin.saveSettings();
+          }));
 
-      const safety = makeSection('🛡️ 安全约束', '这些约束决定清洗是否允许真正写回。');
-
-      new Setting(safety)
-        .setName('🔐 要求文件名唯一')
-        .setDesc('仅当仓库中该图片文件名唯一，且短链接仍解析到同一文件时才允许清洗。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.requireUniqueFilename).onChange(async (value) => {
-          this.plugin.settings.requireUniqueFilename = value;
-          await this.plugin.saveSettings();
-        }));
+      const safety = makeSection('🛡️ 安全条件');
 
       new Setting(safety)
-        .setName('✅ 应用前最终确认')
-        .setDesc('开启后，写回前需要输入 CLEAN。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.requireFinalConfirmation).onChange(async (value) => {
-          this.plugin.settings.requireFinalConfirmation = value;
-          await this.plugin.saveSettings();
-        }));
-    }
+        .setName('要求文件名唯一')
+        .setDesc('只有仓库中该图片文件名没有歧义，且缩短后仍指向同一文件时才允许写回。关闭会提高误链接风险。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.requireUniqueFilename)
+          .onChange(async (value) => {
+            this.plugin.settings.requireUniqueFilename = value;
+            await this.plugin.saveSettings();
+          }));
 
-    if (this.activeTab === 'unused') {
-      const scan = makeSection('🗑️ 未引用图片清理', '扫描附件目录中的图片，判断是否被 Markdown / Canvas 引用；删除操作默认移入系统回收站。');
+      new Setting(safety)
+        .setName('应用前确认')
+        .setDesc('开启后，正式修改笔记前需要再次输入 CLEAN，防止误操作。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.requireFinalConfirmation)
+          .onChange(async (value) => {
+            this.plugin.settings.requireFinalConfirmation = value;
+            await this.plugin.saveSettings();
+          }));
 
-      new Setting(scan)
-        .setName('📎 候选附件目录')
-        .setDesc('每行一个目录。留空表示全库图片都作为候选对象。')
-        .addTextArea((text) => {
-          text.setPlaceholder('900 - Attachments\nassets')
-            .setValue((this.plugin.settings.unusedAttachmentFolders || []).join('\n'))
-            .onChange(async (value) => {
-              this.plugin.settings.unusedAttachmentFolders = parseMultilinePaths(value);
-              await this.plugin.saveSettings();
-            });
-          text.inputEl.rows = 5;
-        });
-
-      new Setting(scan)
-        .setName('✅ 白名单目录')
-        .setDesc('填写后，只在这些目录内检测候选图片；留空表示不限制。')
-        .addTextArea((text) => {
-          text.setPlaceholder('900 - Attachments')
-            .setValue((this.plugin.settings.unusedWhitelistFolders || []).join('\n'))
-            .onChange(async (value) => {
-              this.plugin.settings.unusedWhitelistFolders = parseMultilinePaths(value);
-              await this.plugin.saveSettings();
-            });
-          text.inputEl.rows = 4;
-        });
-
-      new Setting(scan)
-        .setName('🚫 忽略目录')
-        .setDesc('这些目录中的图片永远不会被列为未引用候选。')
-        .addTextArea((text) => {
-          text.setPlaceholder('templates\narchive')
-            .setValue((this.plugin.settings.unusedIgnoreFolders || []).join('\n'))
-            .onChange(async (value) => {
-              this.plugin.settings.unusedIgnoreFolders = parseMultilinePaths(value);
-              await this.plugin.saveSettings();
-            });
-          text.inputEl.rows = 4;
-        });
-
-      new Setting(scan)
-        .setName('📚 引用扫描目录')
-        .setDesc('每行一个目录。留空表示扫描全库 Markdown / Canvas 引用。')
-        .addTextArea((text) => {
-          text.setPlaceholder('300 - Topic Notes\n100 - Literature')
-            .setValue((this.plugin.settings.unusedReferenceFolders || []).join('\n'))
-            .onChange(async (value) => {
-              this.plugin.settings.unusedReferenceFolders = parseMultilinePaths(value);
-              await this.plugin.saveSettings();
-            });
-          text.inputEl.rows = 5;
-        });
-
-      new Setting(scan)
-        .setName('🧩 同时扫描 Canvas')
-        .setDesc('开启后，Canvas 节点中的 file 与 text 引用也会参与判断。')
-        .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.unusedIncludeCanvas)).onChange(async (value) => {
-          this.plugin.settings.unusedIncludeCanvas = value;
-          await this.plugin.saveSettings();
-        }));
-
-      new Setting(scan)
-        .setName('☑️ 打开结果时默认全选')
-        .setDesc('关闭后，结果页不会默认勾选所有未引用图片。')
-        .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.unusedAutoSelectAll)).onChange(async (value) => {
-          this.plugin.settings.unusedAutoSelectAll = value;
-          await this.plugin.saveSettings();
-        }));
-
-      const actions = makeSection('🚀 执行操作', '先扫描，再在结果页确认，最后删除选中图片。');
-      new Setting(actions)
-        .setName('🔍 扫描未引用图片')
-        .setDesc('扫描完成后打开独立结果页，支持搜索、排序、预览与批量删除。')
-        .addButton((btn) => btn.setButtonText('开始扫描').setCta().onClick(async () => {
-          await this.plugin.scanUnusedImagesAndShowResults();
-        }));
-
-      new Setting(actions)
-        .setName('📊 打开未引用结果页')
-        .setDesc('打开上次扫描结果；如果没有扫描结果，则显示空状态。')
-        .addButton((btn) => btn.setButtonText('打开结果页').onClick(async () => {
-          await this.plugin.openUnusedImageView(this.plugin.lastUnusedImageScan || null);
-        }));
-    }
-
-    if (this.activeTab === 'scope') {
-      const scope = makeSection('📂 扫描范围', '限定清洗扫描范围与图片扩展名。');
+      const scope = makeSection('📂 扫描范围');
 
       new Setting(scope)
-        .setName('🔎 扫描目录')
-        .setDesc('每行一个文件夹路径。留空表示扫描整个仓库中的 Markdown 笔记。')
+        .setName('扫描目录')
+        .setDesc('每行一个笔记目录。留空表示扫描整个仓库中的 Markdown 笔记。')
         .addTextArea((text) => {
           text.setPlaceholder('notes\nprojects')
-            .setValue(this.plugin.settings.targetFolders.join('\n'))
+            .setValue((this.plugin.settings.targetFolders || []).join('\n'))
             .onChange(async (value) => {
               this.plugin.settings.targetFolders = parseMultilinePaths(value);
               await this.plugin.saveSettings();
             });
-          text.inputEl.rows = 6;
-          text.inputEl.cols = 40;
+          text.inputEl.rows = 4;
         });
 
       new Setting(scope)
-        .setName('🚧 排除目录')
-        .setDesc('每行一个文件夹路径。命中的 Markdown 笔记会从扫描结果中剔除。')
+        .setName('排除目录')
+        .setDesc('这些目录中的 Markdown 笔记不会参与清洗，可用于排除模板、归档等区域。')
         .addTextArea((text) => {
           text.setPlaceholder('templates\narchive')
             .setValue((this.plugin.settings.excludeFolders || []).join('\n'))
@@ -3099,99 +5861,188 @@ class ImageWorkflowSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
             });
           text.inputEl.rows = 4;
-          text.inputEl.cols = 40;
         });
 
       new Setting(scope)
-        .setName('🧩 图片扩展名')
-        .setDesc('英文逗号分隔，用于判定哪些链接属于图片。')
+        .setName('图片扩展名')
+        .setDesc('只有这些扩展名会被识别为图片链接。英文逗号分隔，例如 png,jpg,webp。')
         .addText((text) => text
           .setPlaceholder('png,jpg,jpeg,gif,webp,svg,bmp,avif')
-          .setValue(this.plugin.settings.imageExtensions.join(','))
+          .setValue((this.plugin.settings.imageExtensions || []).join(','))
           .onChange(async (value) => {
-            this.plugin.settings.imageExtensions = value.split(',').map((v) => v.trim().toLowerCase()).filter(Boolean);
+            this.plugin.settings.imageExtensions = value
+              .split(',')
+              .map((item) => item.trim().toLowerCase())
+              .filter(Boolean);
             await this.plugin.saveSettings();
           }));
 
-      const ui = makeSection('🚪 界面入口', '控制工作流入口是否出现在侧边栏。');
+      const actions = makeSection('▶️ 执行')
 
-      new Setting(ui)
-        .setName('📌 显示侧边栏图标')
-.setDesc('左侧 Ribbon 中显示“图片清洗侧栏”图标；修改后立即生效。')
-        .addToggle((toggle) => toggle.setValue(this.plugin.settings.showRibbonIcon).onChange(async (value) => {
-          this.plugin.settings.showRibbonIcon = value;
-          await this.plugin.saveSettings();
-        }));
-    }
-
-    if (this.activeTab === 'actions') {
-      const mode = makeSection('⚙️ 工作流模式', '模式会一次性调整关键开关，用于按风险等级组织插件行为。');
-
-      new Setting(mode)
-        .setName('🎛️ 当前模式')
-        .setDesc('保守：预览优先；常规：粘贴命名与尺寸；激进：更高自动化。')
-        .addDropdown((dropdown) => dropdown
-          .addOption('conservative', '保守模式')
-          .addOption('normal', '常规模式')
-          .addOption('aggressive', '激进模式')
-          .setValue(this.plugin.settings.workflowMode || 'normal')
-          .onChange(async (value) => {
-            await this.plugin.applyWorkflowMode(value);
-            this.display();
+      new Setting(actions)
+        .setName('预览清洗')
+        .setDesc('只生成修改计划，不写回笔记。侧栏会列出准备缩短的图片链接。')
+        .addButton((btn) => btn
+          .setButtonText('开始预览')
+          .setCta()
+          .onClick(async () => {
+            await this.plugin.previewCleaning();
           }));
 
-      const action = makeSection('🚀 执行操作', '命令面板之外，也可在这里直接触发流程。');
+      new Setting(actions)
+        .setName('应用预览结果')
+        .setDesc('将上一次预览中通过安全检查的修改正式写回笔记。')
+        .addButton((btn) => btn
+          .setButtonText('应用清洗')
+          .onClick(async () => {
+            await this.plugin.applyLastPreview();
+          }));
 
-      new Setting(action)
-        .setName('📏 当前行图片设置尺寸')
-        .setDesc('只修改当前行第一张图片的尺寸，不重命名文件。')
-        .addButton((btn) => btn.setButtonText('设置尺寸').setCta().onClick(async () => {
-          const file = this.plugin.getActiveFile();
-          const embed = file ? this.plugin.findCurrentLineFirstEmbed(file) : null;
-          if (!embed) {
-            new Notice('当前行未检测到图片嵌入');
-            return;
-          }
-          new SizeModal(this.plugin.app, this.plugin.settings.pastedImageSize || '', async (sizeValue) => {
-            await this.plugin.setCurrentLineImageSize(sizeValue, embed);
-          }).open();
-        }));
+      new Setting(actions)
+        .setName('显示侧边栏入口')
+        .setDesc('在左侧 Ribbon 显示清洗入口，便于快速打开预览和执行流程。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.showRibbonIcon)
+          .onChange(async (value) => {
+            this.plugin.settings.showRibbonIcon = value;
+            await this.plugin.saveSettings();
+          }));
+    }
 
-      new Setting(action)
-        .setName('↩️ 撤销上一次图片工作流操作')
-        .setDesc('基于插件日志恢复上一次命名、重排、尺寸或清洗操作。')
-        .addButton((btn) => btn.setButtonText('撤销上一次').onClick(async () => {
-          await this.plugin.rollbackLastOperation();
-        }));
+    if (this.activeTab === 'unused') {
+      const folders = makeSection('📂 扫描范围');
 
-      new Setting(action)
-        .setName('👁️ 预览图片文件名清洗')
-        .setDesc('扫描当前范围并在侧边栏展示差异。')
-        .addButton((btn) => btn.setButtonText('开始预览').setCta().onClick(async () => {
-          await this.plugin.previewCleaning();
-        }));
+      new Setting(folders)
+        .setName('候选图片目录')
+        .setDesc('只有这些目录中的图片会被检查是否未引用。留空表示全库图片都作为候选。')
+        .addTextArea((text) => {
+          text.setPlaceholder('900 - Attachments\nassets')
+            .setValue((this.plugin.settings.unusedAttachmentFolders || []).join('\n'))
+            .onChange(async (value) => {
+              this.plugin.settings.unusedAttachmentFolders = parseMultilinePaths(value);
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.rows = 4;
+        });
 
-      new Setting(action)
-        .setName('🧹 应用上次预览结果')
-        .setDesc('将上次预览中确认可安全修改的内容真正写回。')
-        .addButton((btn) => btn.setButtonText('应用清洗').onClick(async () => {
-          await this.plugin.applyLastPreview();
-        }));
+      new Setting(folders)
+        .setName('候选白名单')
+        .setDesc('进一步限制候选图片必须位于这些目录内。留空表示不额外限制。')
+        .addTextArea((text) => {
+          text.setPlaceholder('900 - Attachments')
+            .setValue((this.plugin.settings.unusedWhitelistFolders || []).join('\n'))
+            .onChange(async (value) => {
+              this.plugin.settings.unusedWhitelistFolders = parseMultilinePaths(value);
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.rows = 3;
+        });
 
-      new Setting(action)
-        .setName('📊 打开图片清洗侧栏')
-        .setDesc('若已有预览则直接打开结果侧栏；否则先执行一次预览。')
-        .addButton((btn) => btn.setButtonText('打开侧栏').onClick(async () => {
-          if (this.plugin.lastPreview) {
-            await this.plugin.openResultView();
-          } else {
-            await this.plugin.previewCleaning();
-          }
-        }));
+      new Setting(folders)
+        .setName('忽略目录')
+        .setDesc('这些目录中的图片永远不会出现在未引用结果中，适合模板、资源库等需要长期保留的目录。')
+        .addTextArea((text) => {
+          text.setPlaceholder('templates\narchive')
+            .setValue((this.plugin.settings.unusedIgnoreFolders || []).join('\n'))
+            .onChange(async (value) => {
+              this.plugin.settings.unusedIgnoreFolders = parseMultilinePaths(value);
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.rows = 3;
+        });
 
-      const tips = makeSection('💡 工作流提示', '用于固定整个插件的使用顺序。');
-      tips.createEl('p', { text: '建议顺序：粘贴自动命名 → 需要时输入尺寸 → 当前文章重排 → 路径链接清洗。' });
-      tips.createEl('p', { text: '当“粘贴时弹出尺寸输入框”开启后，每次粘贴图片都会出现尺寸填入框；输入 500 会生成 ![[xxx.png|500]]。' });
+      new Setting(folders)
+        .setName('引用扫描目录')
+        .setDesc('插件会到这些目录中查找图片引用。留空表示在全库 Markdown / Canvas 中查找。')
+        .addTextArea((text) => {
+          text.setPlaceholder('notes\nprojects')
+            .setValue((this.plugin.settings.unusedReferenceFolders || []).join('\n'))
+            .onChange(async (value) => {
+              this.plugin.settings.unusedReferenceFolders = parseMultilinePaths(value);
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.rows = 4;
+        });
+
+      const behavior = makeSection('⚙️ 扫描行为');
+
+      new Setting(behavior)
+        .setName('保护最近创建的图片')
+        .setDesc('最近 N 天创建的图片不会进入“未引用”结果。设为 0 可关闭保护；建议保留 3–7 天缓冲。')
+        .addText((text) => text
+          .setPlaceholder('3')
+          .setValue(String(this.plugin.settings.unusedProtectRecentDays ?? 3))
+          .onChange(async (value) => {
+            const n = Number(value);
+            this.plugin.settings.unusedProtectRecentDays = Number.isFinite(n)
+              ? Math.max(0, Math.min(3650, Math.floor(n)))
+              : 3;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(behavior)
+        .setName('保护当前笔记引用')
+        .setDesc('即使“引用扫描目录”没有包含当前笔记，当前正在编辑的笔记所引用图片仍强制保护。')
+        .addToggle((toggle) => toggle
+          .setValue(this.plugin.settings.unusedProtectActiveNote !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.unusedProtectActiveNote = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(behavior)
+        .setName('保护文件名关键词')
+        .setDesc('文件名或路径包含这些关键词的图片不会进入未引用结果。逗号或换行分隔；留空关闭。')
+        .addTextArea((text) => {
+          text.setPlaceholder('cover\nlogo\nicon')
+            .setValue(String(this.plugin.settings.unusedProtectNameKeywords || ''))
+            .onChange(async (value) => {
+              this.plugin.settings.unusedProtectNameKeywords = value.trim();
+              await this.plugin.saveSettings();
+            });
+          text.inputEl.rows = 3;
+        });
+
+      new Setting(behavior)
+        .setName('扫描 Canvas')
+        .setDesc('开启后，Canvas 节点中的 file 与 text 引用也会被视为“正在使用”。')
+        .addToggle((toggle) => toggle
+          .setValue(Boolean(this.plugin.settings.unusedIncludeCanvas))
+          .onChange(async (value) => {
+            this.plugin.settings.unusedIncludeCanvas = value;
+            await this.plugin.saveSettings();
+          }));
+
+      new Setting(behavior)
+        .setName('结果默认全选')
+        .setDesc('开启后结果页会默认勾选全部未引用图片。若习惯逐张确认，建议关闭。')
+        .addToggle((toggle) => toggle
+          .setValue(Boolean(this.plugin.settings.unusedAutoSelectAll))
+          .onChange(async (value) => {
+            this.plugin.settings.unusedAutoSelectAll = value;
+            await this.plugin.saveSettings();
+          }));
+
+      const actions = makeSection('📊 扫描与结果');
+
+      new Setting(actions)
+        .setName('扫描未引用图片')
+        .setDesc('检查候选图片是否在指定范围内被引用。完成后自动打开结果页，不会直接删除文件。')
+        .addButton((btn) => btn
+          .setButtonText('开始扫描')
+          .setCta()
+          .onClick(async () => {
+            await this.plugin.scanUnusedImagesAndShowResults();
+          }));
+
+      new Setting(actions)
+        .setName('打开结果页')
+        .setDesc('重新打开上一次扫描结果，继续预览、筛选或处理候选图片。')
+        .addButton((btn) => btn
+          .setButtonText('打开结果页')
+          .onClick(async () => {
+            await this.plugin.openUnusedImageView(this.plugin.lastUnusedImageScan || null);
+          }));
     }
   }
 }
@@ -3282,14 +6133,14 @@ class UnusedImageResultView extends ItemView {
     titleWrap.createEl('h2', { text: '🗑️ 未引用图片' });
     const processedFiles = this.getProcessedFiles();
     titleWrap.createDiv({ cls: 'iwt-unused-subtitle', text: this.scanResult
-      ? `扫描于 ${formatDate(this.scanResult.scannedAt)} · 候选 ${this.scanResult.candidateImageFiles.length} 张 · 未引用 ${this.scanResult.unusedFiles.length} 张 · 已选 ${this.selectedPaths.size} 张`
-      : '扫描附件目录，找出未被 Markdown / Canvas 引用的图片。' });
+      ? `扫描于 ${formatDate(this.scanResult.scannedAt)} · 候选 ${this.scanResult.candidateImageFiles.length} 张 · 近期保护 ${(this.scanResult.protectedRecentFiles || []).length} 张 · 关键词保护 ${(this.scanResult.protectedKeywordFiles || []).length} 张 · 当前笔记保护 ${(this.scanResult.protectedActiveNoteFiles || []).length} 张 · 引用扫描 ${this.scanResult.referenceFileCount || 0} 个文档 · 未引用 ${this.scanResult.unusedFiles.length} 张 · 已选 ${this.selectedPaths.size} 张`
+      : '扫描附件目录，找出在指定 Markdown / Canvas 范围内未发现引用的图片。' });
 
     const toolbar = header.createDiv({ cls: 'iwt-unused-toolbar' });
-    const scanBtn = toolbar.createEl('button', { text: '重新扫描', cls: 'mod-cta' });
-    const selectBtn = toolbar.createEl('button', { text: '全选' });
-    const clearBtn = toolbar.createEl('button', { text: '清空' });
-    const deleteBtn = toolbar.createEl('button', { text: '删除选中', cls: 'mod-warning' });
+    const scanBtn = toolbar.createEl('button', { text: '🔄 重新扫描', cls: 'mod-cta' });
+    const selectBtn = toolbar.createEl('button', { text: '☑️ 全选' });
+    const clearBtn = toolbar.createEl('button', { text: '🧽 清空' });
+    const deleteBtn = toolbar.createEl('button', { text: '🗑️ 删除选中', cls: 'mod-warning' });
     scanBtn.onclick = async () => { await this.plugin.scanUnusedImagesAndShowResults(); };
     selectBtn.onclick = () => { if (this.scanResult) this.selectedPaths = new Set(this.scanResult.unusedFiles.map((file) => file.path)); this.render(); };
     clearBtn.onclick = () => { this.selectedPaths.clear(); this.render(); };
@@ -3311,7 +6162,7 @@ class UnusedImageResultView extends ItemView {
     if (!this.scanResult.unusedFiles.length) {
       const empty = root.createDiv({ cls: 'iwt-unused-empty' });
       empty.createEl('div', { cls: 'iwt-unused-empty-title', text: '没有检测到未引用图片' });
-      empty.createDiv({ text: '当前候选范围内的图片均被引用，或候选范围设置过窄。' });
+      empty.createDiv({ text: '当前候选范围内没有可清理图片；它们可能已被引用、受到近期保护，或候选范围设置较窄。' });
       return;
     }
 
@@ -3353,10 +6204,14 @@ class UnusedImageResultView extends ItemView {
       meta.createDiv({ cls: 'iwt-unused-name', text: file.name });
       meta.createDiv({ cls: 'iwt-unused-path', text: file.path });
       meta.createDiv({ cls: 'iwt-unused-size', text: formatBytes(file.stat.size) });
+      meta.createDiv({
+        cls: 'iwt-unused-reason',
+        text: `判定依据：在本次 ${this.scanResult.referenceFileCount || 0} 个引用扫描文档中未发现引用，且未命中近期/关键词/当前笔记保护。`
+      });
       const actions = row.createDiv({ cls: 'iwt-unused-row-actions' });
-      const previewBtn = actions.createEl('button', { text: '预览' });
+      const previewBtn = actions.createEl('button', { text: '👁️ 预览' });
       previewBtn.onclick = () => this.openImagePreview(file);
-      const deleteOneBtn = actions.createEl('button', { text: '删除', cls: 'mod-warning' });
+      const deleteOneBtn = actions.createEl('button', { text: '🗑️ 删除', cls: 'mod-warning' });
       deleteOneBtn.onclick = () => new IWTUnusedConfirmDeleteModal(this.app, [file], async () => {
         await this.plugin.trashUnusedImageFiles([file]);
       }).open();
@@ -3383,14 +6238,14 @@ class IWTUnusedConfirmDeleteModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: '确认删除未引用图片' });
+    contentEl.createEl('h2', { text: '🗑️ 确认删除未引用图片' });
     contentEl.createEl('p', { text: `即将把 ${this.files.length} 张图片移入系统回收站。该操作不会直接永久删除，但仍建议先确认路径。` });
     const box = contentEl.createDiv({ cls: 'iwt-unused-delete-list' });
     for (const file of this.files.slice(0, 12)) box.createDiv({ text: file.path });
     if (this.files.length > 12) box.createDiv({ text: `……另外 ${this.files.length - 12} 张` });
     const actions = contentEl.createDiv({ cls: 'iwt-unused-toolbar' });
     const cancel = actions.createEl('button', { text: '取消' });
-    const confirm = actions.createEl('button', { text: '移入回收站', cls: 'mod-warning' });
+    const confirm = actions.createEl('button', { text: '🗑️ 移入回收站', cls: 'mod-warning' });
     cancel.onclick = () => this.close();
     confirm.onclick = async () => {
       this.close();
@@ -3414,7 +6269,7 @@ class CleanerResultView extends ItemView {
   }
 
   getDisplayText() {
-    return '图片文件名清洗';
+    return '图片链接清洗';
   }
 
   getIcon() {
@@ -3441,14 +6296,14 @@ class CleanerResultView extends ItemView {
     const root = contentEl.createDiv({ cls: 'ilfc-page' });
 
     const header = root.createDiv({ cls: 'ilfc-header' });
-    header.createEl('h2', { text: '图片文件名清洗' });
+    header.createEl('h2', { text: '图片链接清洗' });
     header.createDiv({ cls: 'ilfc-subtitle', text: this.preview
       ? `扫描于 ${formatDate(this.preview.scannedAt)} · 扫描 ${this.preview.filesScanned} 篇笔记`
       : '将路径型图片链接安全收缩为文件名链接。' });
 
     const toolbar = root.createDiv({ cls: 'ilfc-toolbar' });
-    const previewBtn = toolbar.createEl('button', { text: '重新预览', cls: 'mod-cta' });
-    const applyBtn = toolbar.createEl('button', { text: '应用清洗' });
+    const previewBtn = toolbar.createEl('button', { text: '🔄 重新预览', cls: 'mod-cta' });
+    const applyBtn = toolbar.createEl('button', { text: '✅ 应用清洗' });
     previewBtn.onclick = async () => { await this.plugin.previewCleaning(); };
     applyBtn.onclick = async () => { await this.plugin.applyLastPreview(); };
 
@@ -3551,7 +6406,7 @@ class FinalConfirmModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: '确认应用清洗' });
+    contentEl.createEl('h2', { text: '🧹 确认应用清洗' });
     contentEl.createEl('p', { text: `即将修改 ${this.preview.notesChanged} 篇笔记，写入 ${this.preview.replacements} 处图片链接清洗。` });
     contentEl.createEl('p', { text: '请输入 CLEAN 以确认执行。' });
     const input = contentEl.createEl('input', { type: 'text' });
